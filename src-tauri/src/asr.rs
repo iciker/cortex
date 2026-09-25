@@ -44,7 +44,9 @@ pub fn enqueue(app: &AppHandle, source_id: String) {
 /// Called once at startup (off the critical path).
 pub fn resume_pending(app: &AppHandle) {
     let ids: Vec<String> = {
-        let Some(state) = app.try_state::<crate::db::AppState>() else { return };
+        let Some(state) = app.try_state::<crate::db::AppState>() else {
+            return;
+        };
         let Ok(c) = state.db.lock() else { return };
         let Ok(mut stmt) =
             c.prepare("SELECT id FROM sources WHERE status='ingesting' AND kind='audio'")
@@ -112,7 +114,10 @@ mod inhibitor {
             let mut c = CHILD.lock().unwrap();
             if c.is_none() {
                 // -i: prevent idle system sleep while we run.
-                *c = std::process::Command::new("caffeinate").arg("-i").spawn().ok();
+                *c = std::process::Command::new("caffeinate")
+                    .arg("-i")
+                    .spawn()
+                    .ok();
             }
         }
         #[cfg(target_os = "linux")]

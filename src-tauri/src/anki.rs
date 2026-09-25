@@ -34,7 +34,12 @@ fn sha1(data: &[u8]) -> [u8; 20] {
     for chunk in msg.chunks_exact(64) {
         let mut w = [0u32; 80];
         for (i, wi) in w.iter_mut().take(16).enumerate() {
-            *wi = u32::from_be_bytes([chunk[i * 4], chunk[i * 4 + 1], chunk[i * 4 + 2], chunk[i * 4 + 3]]);
+            *wi = u32::from_be_bytes([
+                chunk[i * 4],
+                chunk[i * 4 + 1],
+                chunk[i * 4 + 2],
+                chunk[i * 4 + 3],
+            ]);
         }
         for i in 16..80 {
             w[i] = (w[i - 3] ^ w[i - 8] ^ w[i - 14] ^ w[i - 16]).rotate_left(1);
@@ -257,7 +262,14 @@ fn build_collection(path: &Path, deck_name: &str, cards: &[(String, String)]) ->
     conn.execute(
         "INSERT INTO col (id,crt,mod,scm,ver,dty,usn,ls,conf,models,decks,dconf,tags)
          VALUES (1,?1,?2,?2,11,0,0,0,?3,?4,?5,?6,'{}')",
-        params![crt, now, conf.to_string(), model.to_string(), decks.to_string(), dconf.to_string()],
+        params![
+            crt,
+            now,
+            conf.to_string(),
+            model.to_string(),
+            decks.to_string(),
+            dconf.to_string()
+        ],
     )?;
 
     for (idx, (front, back)) in cards.iter().enumerate() {
@@ -293,10 +305,7 @@ pub fn export_apkg(dest: &Path, deck_name: &str, cards: &[(String, String)]) -> 
     let col_bytes = std::fs::read(&tmp).map_err(Error::Io)?;
     let _ = std::fs::remove_file(&tmp);
 
-    let zip = zip_store(&[
-        ("collection.anki2", col_bytes),
-        ("media", b"{}".to_vec()),
-    ]);
+    let zip = zip_store(&[("collection.anki2", col_bytes), ("media", b"{}".to_vec())]);
     std::fs::write(dest, zip).map_err(Error::Io)?;
     Ok(())
 }
@@ -455,7 +464,8 @@ fn read_collection(db_path: &Path) -> Result<Vec<ImportedDeck>> {
     let mut deck_names: std::collections::HashMap<i64, String> = std::collections::HashMap::new();
     if let Some(obj) = decks_val.as_object() {
         for (id, d) in obj {
-            if let (Ok(did), Some(name)) = (id.parse::<i64>(), d.get("name").and_then(|n| n.as_str()))
+            if let (Ok(did), Some(name)) =
+                (id.parse::<i64>(), d.get("name").and_then(|n| n.as_str()))
             {
                 deck_names.insert(did, name.to_string());
             }
@@ -506,7 +516,10 @@ fn read_collection(db_path: &Path) -> Result<Vec<ImportedDeck>> {
         if !by_deck.contains_key(&did) {
             order.push(did);
         }
-        by_deck.entry(did).or_default().push(ImportedCard { front, back });
+        by_deck
+            .entry(did)
+            .or_default()
+            .push(ImportedCard { front, back });
         total += 1;
         if total > MAX_IMPORT {
             return Err(Error::Other(format!(
@@ -555,8 +568,14 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let dest = dir.join("deck.apkg");
         let cards = vec![
-            ("What is ATP?".to_string(), "Adenosine triphosphate".to_string()),
-            ("Powerhouse of the cell?".to_string(), "Mitochondria".to_string()),
+            (
+                "What is ATP?".to_string(),
+                "Adenosine triphosphate".to_string(),
+            ),
+            (
+                "Powerhouse of the cell?".to_string(),
+                "Mitochondria".to_string(),
+            ),
         ];
         export_apkg(&dest, "Biology", &cards).unwrap();
 
@@ -565,15 +584,21 @@ mod tests {
         assert_eq!(&bytes[0..4], &[0x50, 0x4b, 0x03, 0x04]);
         assert!(bytes.windows(4).any(|w| w == [0x50, 0x4b, 0x05, 0x06]));
         // Contains both archive members.
-        assert!(bytes.windows(b"collection.anki2".len()).any(|w| w == b"collection.anki2"));
+        assert!(bytes
+            .windows(b"collection.anki2".len())
+            .any(|w| w == b"collection.anki2"));
         assert!(bytes.windows(b"media".len()).any(|w| w == b"media"));
 
         // The embedded collection.anki2 must be a real SQLite DB with 2 notes/cards.
         let tmp = dir.join("roundtrip.anki2");
         build_collection(&tmp, "Biology", &cards).unwrap();
         let conn = Connection::open(&tmp).unwrap();
-        let notes: i64 = conn.query_row("SELECT count(*) FROM notes", [], |r| r.get(0)).unwrap();
-        let cnt: i64 = conn.query_row("SELECT count(*) FROM cards", [], |r| r.get(0)).unwrap();
+        let notes: i64 = conn
+            .query_row("SELECT count(*) FROM notes", [], |r| r.get(0))
+            .unwrap();
+        let cnt: i64 = conn
+            .query_row("SELECT count(*) FROM cards", [], |r| r.get(0))
+            .unwrap();
         assert_eq!(notes, 2);
         assert_eq!(cnt, 2);
         let _ = std::fs::remove_dir_all(&dir);
@@ -581,7 +606,10 @@ mod tests {
 
     #[test]
     fn entities_and_html_are_cleaned() {
-        assert_eq!(decode_entities("a &amp; b &lt;c&gt; &quot;d&quot;"), "a & b <c> \"d\"");
+        assert_eq!(
+            decode_entities("a &amp; b &lt;c&gt; &quot;d&quot;"),
+            "a & b <c> \"d\""
+        );
         assert_eq!(decode_entities("x&nbsp;y"), "x y");
         assert_eq!(decode_entities("&#65;&#x42;"), "AB");
         // Unknown entity is left intact (no infinite loop, no wrong substitution).
@@ -598,8 +626,14 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let dest = dir.join("deck.apkg");
         let cards = vec![
-            ("What is ATP?".to_string(), "Adenosine triphosphate".to_string()),
-            ("Powerhouse of the cell?".to_string(), "Mitochondria".to_string()),
+            (
+                "What is ATP?".to_string(),
+                "Adenosine triphosphate".to_string(),
+            ),
+            (
+                "Powerhouse of the cell?".to_string(),
+                "Mitochondria".to_string(),
+            ),
         ];
         export_apkg(&dest, "Biology", &cards).unwrap();
 

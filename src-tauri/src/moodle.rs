@@ -75,15 +75,28 @@ fn ws(url: &str, token: &str, func: &str, params: &[(String, String)]) -> Result
     })?;
     if let Some(obj) = val.as_object() {
         if obj.contains_key("exception") {
-            let msg = obj.get("message").and_then(|m| m.as_str()).unwrap_or("request failed");
+            let msg = obj
+                .get("message")
+                .and_then(|m| m.as_str())
+                .unwrap_or("request failed");
             // Surface errorcode + debuginfo (when present) + the raw response — they
             // pinpoint *which* parameter/why (e.g. "invalidtoken" vs "invalidparameter").
             let code = obj.get("errorcode").and_then(|m| m.as_str()).unwrap_or("");
             let debug = obj.get("debuginfo").and_then(|m| m.as_str()).unwrap_or("");
-            let code_part = if code.is_empty() { String::new() } else { format!(" [{code}]") };
-            let debug_part = if debug.is_empty() { String::new() } else { format!(" — {debug}") };
+            let code_part = if code.is_empty() {
+                String::new()
+            } else {
+                format!(" [{code}]")
+            };
+            let debug_part = if debug.is_empty() {
+                String::new()
+            } else {
+                format!(" — {debug}")
+            };
             let raw = body.chars().take(400).collect::<String>();
-            return Err(Error::Other(format!("Moodle{code_part}: {msg}{debug_part} :: raw={raw}")));
+            return Err(Error::Other(format!(
+                "Moodle{code_part}: {msg}{debug_part} :: raw={raw}"
+            )));
         }
     }
     Ok(val)
@@ -94,11 +107,7 @@ fn fetch_token(url: &str, user: &str, pass: &str) -> Result<String> {
     let endpoint = format!("{url}/login/token.php");
     let resp = client()
         .post(&endpoint)
-        .form(&[
-            ("username", user),
-            ("password", pass),
-            ("service", SERVICE),
-        ])
+        .form(&[("username", user), ("password", pass), ("service", SERVICE)])
         .send()?;
     let val: Value = resp.json()?;
     if let Some(t) = val.get("token").and_then(|t| t.as_str()) {
@@ -302,7 +311,10 @@ pub fn handle_sso_uri(app: &AppHandle, raw_uri: &str) {
     let url = {
         let state = app.state::<AppState>();
         let c = state.db.lock().unwrap();
-        repo::get_setting(&c, K_URL).ok().flatten().unwrap_or_default()
+        repo::get_setting(&c, K_URL)
+            .ok()
+            .flatten()
+            .unwrap_or_default()
     };
     match handle_sso_token(app, &url, &token_raw) {
         Ok(name) => {
@@ -790,7 +802,8 @@ pub async fn moodle_sync(app: AppHandle) -> Result<MoodleSummary> {
 pub fn moodle_data(state: tauri::State<AppState>) -> Result<MoodleData> {
     let c = state.db.lock().unwrap();
     let courses = {
-        let mut st = c.prepare("SELECT id, shortname, fullname FROM moodle_courses ORDER BY fullname")?;
+        let mut st =
+            c.prepare("SELECT id, shortname, fullname FROM moodle_courses ORDER BY fullname")?;
         let rows = st.query_map([], |r| {
             Ok(MoodleCourse {
                 id: r.get(0)?,
@@ -900,7 +913,11 @@ pub fn moodle_autolink(state: tauri::State<AppState>) -> Result<usize> {
             "SELECT id, name, IFNULL(code,'') FROM subjects WHERE moodle_course_id IS NULL OR moodle_course_id=''",
         )?;
         let rows = st.query_map([], |r| {
-            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?))
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+            ))
         })?;
         rows.filter_map(|x| x.ok()).collect()
     };
@@ -913,8 +930,8 @@ pub fn moodle_autolink(state: tauri::State<AppState>) -> Result<usize> {
         for (cid, short, full) in &courses {
             let n_short = squash(short);
             let n_full = squash(full);
-            let code_hit = !n_code.is_empty()
-                && (n_short.contains(&n_code) || n_full.contains(&n_code));
+            let code_hit =
+                !n_code.is_empty() && (n_short.contains(&n_code) || n_full.contains(&n_code));
             let name_hit = !n_name.is_empty()
                 && n_name.len() >= 4
                 && (n_full.contains(&n_name)

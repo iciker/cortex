@@ -179,8 +179,8 @@ fn ensure_mpv(socket: &Path, ytdlp: &Path, volume: u8) -> Result<()> {
 fn ipc(socket: &Path, cmd: &Value) -> Result<()> {
     use std::io::Write;
     use std::os::unix::net::UnixStream;
-    let mut stream = UnixStream::connect(socket)
-        .map_err(|e| Error::Other(format!("mpv not reachable: {e}")))?;
+    let mut stream =
+        UnixStream::connect(socket).map_err(|e| Error::Other(format!("mpv not reachable: {e}")))?;
     let mut line = serde_json::to_vec(cmd)?;
     line.push(b'\n');
     stream.write_all(&line)?;
@@ -212,7 +212,9 @@ pub fn media_tools_status(app: AppHandle) -> Result<MediaTools> {
     Ok(MediaTools {
         mpv: find_on_path("mpv").is_some(),
         ffmpeg: find_on_path("ffmpeg").is_some(),
-        ytdlp: crate::ingest::bundled("yt-dlp").is_some() || downloaded.is_file() || find_on_path("yt-dlp").is_some(),
+        ytdlp: crate::ingest::bundled("yt-dlp").is_some()
+            || downloaded.is_file()
+            || find_on_path("yt-dlp").is_some(),
         ytdlp_path: downloaded.display().to_string(),
     })
 }
@@ -246,13 +248,13 @@ pub fn youtube_play(app: AppHandle, url: String, volume: u8) -> Result<()> {
         // Miss: fall back to the original URL (mpv's ytdl hook resolves it — the
         // user waits no longer than before) and prime the cache so the SECOND play
         // is instant. This also auto-covers user-added stations on first play.
-        ipc(
-            &socket,
-            &json!({ "command": ["loadfile", url, "replace"] }),
-        )?;
+        ipc(&socket, &json!({ "command": ["loadfile", url, "replace"] }))?;
         spawn_resolve_and_cache(dir.clone(), ytdlp.clone(), url.clone());
     }
-    ipc(&socket, &json!({ "command": ["set_property", "pause", false] }))?;
+    ipc(
+        &socket,
+        &json!({ "command": ["set_property", "pause", false] }),
+    )?;
     ipc(
         &socket,
         &json!({ "command": ["set_property", "volume", volume as i64] }),
@@ -263,14 +265,20 @@ pub fn youtube_play(app: AppHandle, url: String, volume: u8) -> Result<()> {
 #[tauri::command]
 pub fn youtube_pause(app: AppHandle) -> Result<()> {
     let dir = data_dir(&app)?;
-    ipc_soft(&socket_path(&dir), &json!({ "command": ["set_property", "pause", true] }));
+    ipc_soft(
+        &socket_path(&dir),
+        &json!({ "command": ["set_property", "pause", true] }),
+    );
     Ok(())
 }
 
 #[tauri::command]
 pub fn youtube_resume(app: AppHandle) -> Result<()> {
     let dir = data_dir(&app)?;
-    ipc_soft(&socket_path(&dir), &json!({ "command": ["set_property", "pause", false] }));
+    ipc_soft(
+        &socket_path(&dir),
+        &json!({ "command": ["set_property", "pause", false] }),
+    );
     Ok(())
 }
 

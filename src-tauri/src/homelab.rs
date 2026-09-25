@@ -63,8 +63,14 @@ pub fn resolve(primary: &str, ts: Option<&str>, pubb: Option<&str>) -> String {
     if primary.is_empty() {
         return primary;
     }
-    let ts = ts.map(str::trim).filter(|s| !s.is_empty()).map(str::to_string);
-    let pubb = pubb.map(str::trim).filter(|s| !s.is_empty()).map(str::to_string);
+    let ts = ts
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
+    let pubb = pubb
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
     if ts.is_none() && pubb.is_none() {
         return primary; // no fallbacks configured — nothing to probe
     }
@@ -95,7 +101,10 @@ pub fn resolve(primary: &str, ts: Option<&str>, pubb: Option<&str>) -> String {
 fn spawn_probe(primary: String, ts: Option<String>, pubb: Option<String>) {
     {
         let mut guard = PROBING.lock().unwrap();
-        if !guard.get_or_insert_with(HashSet::new).insert(primary.clone()) {
+        if !guard
+            .get_or_insert_with(HashSet::new)
+            .insert(primary.clone())
+        {
             return; // a probe for this origin is already running
         }
     }
@@ -152,10 +161,18 @@ pub fn warm(state: &crate::db::AppState) {
         let Ok(c) = state.db.lock() else {
             return;
         };
-        let ts = repo::get_setting(&c, "homelab_tailscale_base").ok().flatten();
+        let ts = repo::get_setting(&c, "homelab_tailscale_base")
+            .ok()
+            .flatten();
         let pubb = repo::get_setting(&c, "homelab_public_base").ok().flatten();
         let mut primaries: Vec<String> = Vec::new();
-        for key in ["sync_url", "ollama_url", "whisper_url", "searxng_url", "ingest_url"] {
+        for key in [
+            "sync_url",
+            "ollama_url",
+            "whisper_url",
+            "searxng_url",
+            "ingest_url",
+        ] {
             if let Some(p) = warm_primary(&c, key) {
                 if !primaries.contains(&p) {
                     primaries.push(p);
@@ -164,9 +181,9 @@ pub fn warm(state: &crate::db::AppState) {
         }
         (ts, pubb, primaries)
     }; // <-- DB lock released here, before any network probe
-    // We're on the background sync thread, so a blocking probe is fine here — it
-    // populates the cache directly, so hot-path resolve() returns the reachable origin
-    // without ever probing inline.
+       // We're on the background sync thread, so a blocking probe is fine here — it
+       // populates the cache directly, so hot-path resolve() returns the reachable origin
+       // without ever probing inline.
     for primary in primaries {
         let chosen = probe(&primary, ts.as_deref(), pubb.as_deref());
         CACHE
@@ -189,15 +206,19 @@ fn warm_primary(conn: &Connection, key: &str) -> Option<String> {
         return Some(raw);
     }
     if service_path(key).is_some() {
-        return ["homelab_base", "homelab_tailscale_base", "homelab_public_base"]
-            .iter()
-            .find_map(|k| {
-                repo::get_setting(conn, k)
-                    .ok()
-                    .flatten()
-                    .filter(|s| !s.trim().is_empty())
-            })
-            .map(|b| b.trim().trim_end_matches('/').to_string());
+        return [
+            "homelab_base",
+            "homelab_tailscale_base",
+            "homelab_public_base",
+        ]
+        .iter()
+        .find_map(|k| {
+            repo::get_setting(conn, k)
+                .ok()
+                .flatten()
+                .filter(|s| !s.trim().is_empty())
+        })
+        .map(|b| b.trim().trim_end_matches('/').to_string());
     }
     None
 }
@@ -295,8 +316,12 @@ mod tests {
 pub fn resolved_setting(conn: &Connection, key: &str) -> Option<String> {
     // Read the fallback bases once, up front, so the (network) resolve below is
     // connection-free — see resolve()'s contract about never probing under the DB lock.
-    let ts = repo::get_setting(conn, "homelab_tailscale_base").ok().flatten();
-    let pubb = repo::get_setting(conn, "homelab_public_base").ok().flatten();
+    let ts = repo::get_setting(conn, "homelab_tailscale_base")
+        .ok()
+        .flatten();
+    let pubb = repo::get_setting(conn, "homelab_public_base")
+        .ok()
+        .flatten();
     // An explicit per-service URL wins (override) — keeps existing setups working
     // and lets a service live somewhere other than the unified homelab.
     if let Some(raw) = repo::get_setting(conn, key)
@@ -310,16 +335,24 @@ pub fn resolved_setting(conn: &Connection, key: &str) -> Option<String> {
     // base, but fall back to the Tailscale/public base when that's all the user set —
     // e.g. a phone that only ever reaches the homelab over Tailscale (no LAN URL).
     if let Some(path) = service_path(key) {
-        let base = ["homelab_base", "homelab_tailscale_base", "homelab_public_base"]
-            .iter()
-            .find_map(|k| {
-                repo::get_setting(conn, k)
-                    .ok()
-                    .flatten()
-                    .filter(|s| !s.trim().is_empty())
-            });
+        let base = [
+            "homelab_base",
+            "homelab_tailscale_base",
+            "homelab_public_base",
+        ]
+        .iter()
+        .find_map(|k| {
+            repo::get_setting(conn, k)
+                .ok()
+                .flatten()
+                .filter(|s| !s.trim().is_empty())
+        });
         if let Some(base) = base {
-            let resolved = resolve(base.trim().trim_end_matches('/'), ts.as_deref(), pubb.as_deref());
+            let resolved = resolve(
+                base.trim().trim_end_matches('/'),
+                ts.as_deref(),
+                pubb.as_deref(),
+            );
             return Some(inject_token(conn, key, format!("{resolved}{path}")));
         }
     }
@@ -391,7 +424,7 @@ pub async fn homelab_status(app: tauri::AppHandle) -> crate::error::Result<Vec<S
         // Short lock: resolve each service URL + read sync creds, then release.
         // (resolved_setting probes the network on cache miss, but the Test button
         // is explicit user action and warm() usually has the cache hot.)
-        let (urls, sync_user, sync_pass) = {
+        let (urls, sync_user, sync_pass, transcription_mode) = {
             let c = state.db.lock().unwrap();
             let mut urls: HashMap<&'static str, Option<String>> = HashMap::new();
             for key in ["searxng_url", "whisper_url", "sync_url", "syncd_url", "ingest_url", "ollama_url"] {
@@ -401,6 +434,10 @@ pub async fn homelab_status(app: tauri::AppHandle) -> crate::error::Result<Vec<S
                 urls,
                 repo::get_setting(&c, "sync_user").ok().flatten().unwrap_or_default(),
                 repo::get_setting(&c, "sync_pass").ok().flatten().unwrap_or_default(),
+                repo::get_setting(&c, "transcription_mode")
+                    .ok()
+                    .flatten()
+                    .unwrap_or_default(),
             )
         };
         let client = reqwest::blocking::Client::builder()
@@ -439,7 +476,17 @@ pub async fn homelab_status(app: tauri::AppHandle) -> crate::error::Result<Vec<S
             }
         }
 
-        // Whisper — distinguish the WhisperX lecture server from a legacy install.
+        // Whisper is optional when completed realtime captions are the source
+        // of truth. Do not report an intentionally stopped service as broken.
+        if transcription_mode == "realtime" {
+            push(
+                "whisper",
+                "Whisper · optional refinement",
+                false,
+                false,
+                "disabled by Realtime only mode".into(),
+            );
+        } else {
         match u("whisper_url") {
             None => push("whisper", "Whisper · lecture transcription", false, false, unconfigured.clone()),
             Some(url) => {
@@ -457,6 +504,7 @@ pub async fn homelab_status(app: tauri::AppHandle) -> crate::error::Result<Vec<S
                 };
                 push("whisper", "Whisper · lecture transcription", true, ok, detail);
             }
+        }
         }
 
         // WebDAV vault (/sync) — files + snapshot fallback; own Basic credentials.

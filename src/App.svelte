@@ -25,7 +25,8 @@
   import LiveActivity from "./components/LiveActivity.svelte";
   import RecordingActivity from "./components/RecordingActivity.svelte";
   import { keybinds } from "./lib/keybinds.svelte";
-  import { isMobile } from "./lib/platform";
+  import { isMacOS, isMobile } from "./lib/platform";
+  import { preflightMicrophonePermission } from "./lib/microphone-permission";
   import MobileShell from "./shell/MobileShell.svelte";
 
   import Dashboard from "./views/Dashboard.svelte";
@@ -71,7 +72,28 @@
 
   // Initialize app state on mount (loads subjects, seeds demo if empty, restores theme)
   $effect(() => {
-    app.init();
+    let cancelled = false;
+    let microphoneTimer: ReturnType<typeof setTimeout> | null = null;
+    void app.init().finally(() => {
+      if (cancelled || !isMacOS) return;
+      try {
+        if (localStorage.getItem("cortex-microphone-preflight") === "1") return;
+        // Wait until the hidden startup window has been revealed and painted so
+        // macOS can attach its consent sheet to a visible Cortex window.
+        microphoneTimer = setTimeout(() => {
+          if (cancelled) return;
+          void preflightMicrophonePermission().then((result) => {
+            // Device/runtime failures are retryable on the next launch. A real
+            // macOS permission decision only needs this one startup preflight.
+            if (result === "unavailable") return;
+            try { localStorage.setItem("cortex-microphone-preflight", "1"); } catch { /* unavailable */ }
+          });
+        }, 350);
+      } catch {
+        // localStorage being unavailable must not suppress the OS permission ask.
+        void preflightMicrophonePermission();
+      }
+    });
     const prefetch = setTimeout(() => {
       void loadSettings();
       void loadRecorder();
@@ -79,7 +101,11 @@
       void loadAnalytics();
       void loadExam();
     }, 1500);
-    return () => clearTimeout(prefetch);
+    return () => {
+      cancelled = true;
+      clearTimeout(prefetch);
+      if (microphoneTimer) clearTimeout(microphoneTimer);
+    };
   });
 
   // Chat dock / FAB visibility. Read EVERY signal into a local first so &&/||

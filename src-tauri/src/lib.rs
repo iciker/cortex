@@ -308,6 +308,9 @@ pub fn run() {
             commands::archive_subject,
             commands::list_archived_subjects,
             commands::open_external,
+            commands::open_microphone_settings,
+            commands::open_system_audio_settings,
+            commands::runtime_platform,
             commands::create_topic,
             commands::update_topic,
             commands::delete_topic,
@@ -325,6 +328,7 @@ pub fn run() {
             commands::add_source,
             commands::stage_upload,
             commands::reingest_source,
+            commands::commit_live_transcript,
             commands::search_chunks,
             commands::global_search,
             commands::seed_demo,
@@ -363,10 +367,12 @@ pub fn run() {
             commands::get_all_settings,
             commands::set_settings,
             commands::ollama_models,
+            commands::lmstudio_models,
             commands::verify_provider,
             commands::save_recording,
             commands::save_recording_raw,
             commands::transcribe_partial,
+            commands::translate_caption,
             commands::check_whisper_model,
             recorder::save_recording_path,
             recorder::native_rec_discard,
@@ -376,6 +382,7 @@ pub fn run() {
             recorder::native_rec_stop,
             recorder::native_rec_cancel,
             recorder::native_rec_level,
+            recorder::native_rec_chunk,
             commands::web_search,
             commands::add_memory,
             commands::list_memory,
@@ -501,8 +508,15 @@ mod pipeline_tests {
         let vecs = ingest::embed_chunks(&emb, &chunks).unwrap();
         for (i, (chunk, v)) in chunks.iter().zip(vecs.iter()).enumerate() {
             repo::insert_chunk(
-                &c, &srcid, &sid, Some(&tid), i as i64, chunk, None,
-                v.len() as i64, &f32s_to_blob(v),
+                &c,
+                &srcid,
+                &sid,
+                Some(&tid),
+                i as i64,
+                chunk,
+                None,
+                v.len() as i64,
+                &f32s_to_blob(v),
             )
             .unwrap();
         }
@@ -510,7 +524,9 @@ mod pipeline_tests {
         assert!(repo::count_chunks(&c, &srcid).unwrap() > 0, "chunks stored");
 
         // query retrieval: a related query should surface this source as top hit
-        let qvec = &emb.embed(&["memoization overlapping subproblems".into()]).unwrap()[0];
+        let qvec = &emb
+            .embed(&["memoization overlapping subproblems".into()])
+            .unwrap()[0];
         let hits = repo::search_chunks(&c, Some(&sid), qvec, 5).unwrap();
         assert!(!hits.is_empty(), "search returned hits");
         assert_eq!(hits[0].source_id, srcid, "top hit is the ingested source");

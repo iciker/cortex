@@ -10,5 +10,7 @@
 	<string>Cortex uses your microphone to record lectures for transcription.</string>
 	<key>NSCameraUsageDescription</key>
 	<string>Cortex uses your camera to capture photos for your notes.</string>
+	<key>NSScreenCaptureUsageDescription</key>
+	<string>Cortex uses ScreenCaptureKit to include system audio when you enable combined lecture recording.</string>
 </dict>
 </plist>

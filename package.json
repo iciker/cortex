@@ -1,6 +1,6 @@
 {
   "name": "cortex",
-  "version": "1.0.35",
+  "version": "1.0.37",
   "description": "Cortex — desktop study OS",
   "license": "Apache-2.0",
   "type": "module",
@@ -11,6 +11,7 @@
     "check": "svelte-check --tsconfig ./tsconfig.json",
     "i18n:audit": "bun scripts/i18n-audit.ts",
     "sidecars": "bun scripts/fetch-sidecars.mjs",
+    "macos:local": "tauri build --debug --bundles app --config src-tauri/tauri.macos.local.conf.json",
     "tauri": "tauri"
   },
   "dependencies": {
@@ -27,6 +28,7 @@
     "@tsconfig/svelte": "^5.0.4",
     "@types/bun": "^1.4.0",
     "@types/katex": "^0.16.8",
+    "@types/node": "^26.3.0",
     "autoprefixer": "^10.4.20",
     "postcss": "^8.4.49",
     "svelte": "^5.56.3",

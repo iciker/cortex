@@ -217,7 +217,10 @@ fn store_tokens(conn: &Connection, token: &serde_json::Value) -> Result<()> {
             repo::set_setting(conn, "google_refresh_token", refresh)?;
         }
     }
-    let expires_in = token.get("expires_in").and_then(|v| v.as_i64()).unwrap_or(3600);
+    let expires_in = token
+        .get("expires_in")
+        .and_then(|v| v.as_i64())
+        .unwrap_or(3600);
     let expiry = now_ms() + expires_in * 1_000;
     repo::set_setting(conn, "google_token_expiry", &expiry.to_string())?;
     Ok(())
@@ -282,7 +285,9 @@ fn fetch_email(access_token: &str) -> Option<String> {
         return None;
     }
     let json: serde_json::Value = resp.json().ok()?;
-    json.get("email").and_then(|v| v.as_str()).map(|s| s.to_string())
+    json.get("email")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
 }
 
 // ---- loopback OAuth helper --------------------------------------------
@@ -339,7 +344,9 @@ fn await_oauth_code(listener: &TcpListener) -> Result<String> {
     let _ = stream.flush();
 
     if let Some(e) = err {
-        return Err(Error::Other(format!("Google authorization was denied: {e}")));
+        return Err(Error::Other(format!(
+            "Google authorization was denied: {e}"
+        )));
     }
     code.ok_or_else(|| Error::Other("no authorization code returned by Google".into()))
 }
@@ -424,7 +431,9 @@ pub async fn google_list_calendars(app: AppHandle) -> Result<Vec<GoogleCalendar>
         let (client_id, client_secret, cal_id, selected_csv) = {
             let c = state.db.lock().unwrap();
             let (id, secret) = client_creds(&c)?.ok_or_else(|| {
-                Error::Other("Google Calendar is not configured — add credentials in Settings.".into())
+                Error::Other(
+                    "Google Calendar is not configured — add credentials in Settings.".into(),
+                )
             })?;
             (
                 id,
@@ -458,16 +467,25 @@ pub async fn google_list_calendars(app: AppHandle) -> Result<Vec<GoogleCalendar>
                 .and_then(|e| e.get("message"))
                 .and_then(|v| v.as_str())
                 .unwrap_or("calendar list failed");
-            return Err(Error::Other(format!("Could not list Google calendars: {msg}")));
+            return Err(Error::Other(format!(
+                "Could not list Google calendars: {msg}"
+            )));
         }
         let mut out = Vec::new();
         if let Some(items) = json.get("items").and_then(|v| v.as_array()) {
             for cal in items {
-                let id = cal.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                let id = cal
+                    .get("id")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
                 if id.is_empty() {
                     continue;
                 }
-                let primary = cal.get("primary").and_then(|v| v.as_bool()).unwrap_or(false);
+                let primary = cal
+                    .get("primary")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
                 let raw = cal
                     .get("summaryOverride")
                     .and_then(|v| v.as_str())
@@ -492,7 +510,13 @@ pub async fn google_list_calendars(app: AppHandle) -> Result<Vec<GoogleCalendar>
                     .unwrap_or("")
                     .to_string();
                 let sel = selected.contains(&id) || (default_on && (primary || id == cal_id));
-                out.push(GoogleCalendar { id, summary, primary, selected: sel, color });
+                out.push(GoogleCalendar {
+                    id,
+                    summary,
+                    primary,
+                    selected: sel,
+                    color,
+                });
             }
         }
         Ok(out)

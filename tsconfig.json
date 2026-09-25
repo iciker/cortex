@@ -13,6 +13,6 @@
     "skipLibCheck": true,
     "verbatimModuleSyntax": false
   },
-  "include": ["src/**/*.ts", "src/**/*.js", "src/**/*.svelte"],
+  "include": ["src/**/*.ts", "src/**/*.js", "src/**/*.svelte", "src-tauri/**/*.test.ts"],
   "references": [{ "path": "./tsconfig.node.json" }]
 }

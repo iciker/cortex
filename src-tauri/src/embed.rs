@@ -34,7 +34,11 @@ impl StubEmbedder {
             tok.hash(&mut h);
             let idx = (h.finish() as usize) % STUB_DIM;
             // sign from a second hash bit for some cancellation
-            let sign = if (h.finish() >> 33) & 1 == 0 { 1.0 } else { -1.0 };
+            let sign = if (h.finish() >> 33) & 1 == 0 {
+                1.0
+            } else {
+                -1.0
+            };
             v[idx] += sign;
         }
         // L2 normalize
@@ -136,7 +140,11 @@ pub struct OllamaEmbedder {
 impl OllamaEmbedder {
     /// Legacy one-text-per-request endpoint, kept as a fallback for Ollama
     /// versions that predate the batched `/api/embed`.
-    fn embed_singly(&self, client: &reqwest::blocking::Client, texts: &[String]) -> Result<Vec<Vec<f32>>> {
+    fn embed_singly(
+        &self,
+        client: &reqwest::blocking::Client,
+        texts: &[String],
+    ) -> Result<Vec<Vec<f32>>> {
         let url = format!("{}/api/embeddings", self.base_url.trim_end_matches('/'));
         let mut out = Vec::with_capacity(texts.len());
         for t in texts {
@@ -251,7 +259,9 @@ mod tests {
     fn similar_text_scores_higher_than_unrelated() {
         use crate::vector::cosine;
         let e = StubEmbedder;
-        let q = &e.embed(&["dynamic programming memoization".into()]).unwrap()[0];
+        let q = &e
+            .embed(&["dynamic programming memoization".into()])
+            .unwrap()[0];
         let close = &e
             .embed(&["memoization in dynamic programming".into()])
             .unwrap()[0];

@@ -125,9 +125,8 @@ pub async fn generate_exam(
             total = mcq_n + written_n,
             first_written = mcq_n + 1,
         );
-        let user = format!(
-            "Exam scope: {scope}\n\nSOURCE MATERIAL:\n{context}\n\nWrite the exam now."
-        );
+        let user =
+            format!("Exam scope: {scope}\n\nSOURCE MATERIAL:\n{context}\n\nWrite the exam now.");
 
         let raw = model.complete(&system, &user)?;
         let mut questions = llm::extract_json(&raw)
@@ -149,7 +148,14 @@ pub async fn generate_exam(
 
         let exam = {
             let c = state.db.lock().unwrap();
-            let id = repo::insert_exam(&c, &subject_id, &topics, &title, duration as i64, &questions)?;
+            let id = repo::insert_exam(
+                &c,
+                &subject_id,
+                &topics,
+                &title,
+                duration as i64,
+                &questions,
+            )?;
             // Re-read by id so the frontend gets the canonical row (timestamps, status).
             repo::get_exam(&c, &id)?
         };
@@ -168,7 +174,9 @@ fn normalize_questions(questions: &mut Value) {
     };
     let mut cleaned: Vec<Value> = Vec::with_capacity(arr.len());
     for (i, item) in arr.iter().enumerate() {
-        let Some(obj) = item.as_object() else { continue };
+        let Some(obj) = item.as_object() else {
+            continue;
+        };
         let q = obj.get("q").and_then(|v| v.as_str()).unwrap_or("").trim();
         if q.is_empty() {
             continue;
@@ -179,8 +187,8 @@ fn normalize_questions(questions: &mut Value) {
             .filter(|s| !s.is_empty())
             .map(|s| s.to_string())
             .unwrap_or_else(|| format!("q{}", i + 1));
-        let is_mcq = obj.get("type").and_then(|v| v.as_str()) == Some("mcq")
-            || obj.get("options").is_some();
+        let is_mcq =
+            obj.get("type").and_then(|v| v.as_str()) == Some("mcq") || obj.get("options").is_some();
         if is_mcq {
             let options: Vec<String> = obj
                 .get("options")
@@ -247,11 +255,7 @@ pub struct ExamAnswer {
 /// written items are graded together in ONE LLM call. Stores answers + results +
 /// score, flips status to graded, and returns the results JSON.
 #[tauri::command]
-pub async fn submit_exam(
-    app: AppHandle,
-    id: String,
-    answers: Vec<ExamAnswer>,
-) -> Result<Value> {
+pub async fn submit_exam(app: AppHandle, id: String, answers: Vec<ExamAnswer>) -> Result<Value> {
     tauri::async_runtime::spawn_blocking(move || grade_exam_inner(&app, &id, &answers))
         .await
         .map_err(|e| Error::Other(format!("background task failed: {e}")))?
@@ -273,7 +277,9 @@ pub async fn remark_exam(app: AppHandle, id: String) -> Result<Value> {
                 .map_err(|_| Error::Other("this exam has no stored answers to remark".into()))?
         };
         if answers.is_empty() {
-            return Err(Error::Other("this exam has no stored answers to remark".into()));
+            return Err(Error::Other(
+                "this exam has no stored answers to remark".into(),
+            ));
         }
         grade_exam_inner(&app, &id, &answers)
     })
@@ -284,103 +290,107 @@ pub async fn remark_exam(app: AppHandle, id: String) -> Result<Value> {
 /// Shared grading core for submit + remark: MCQs grade locally, written answers
 /// go to the model in one verified-then-scored call.
 fn grade_exam_inner(app: &AppHandle, id: &str, answers: &[ExamAnswer]) -> Result<Value> {
-        let state = app.state::<AppState>();
+    let state = app.state::<AppState>();
 
-        // Load the exam + model config under the lock.
-        let (exam, context, spec, keys) = {
-            let c = state.db.lock().unwrap();
-            let exam = repo::get_exam(&c, id)?;
-            let topics: Vec<String> = exam.topic_ids.clone();
-            let context = exam_context(&c, &exam.subject_id, &topics)?;
-            let spec = repo::get_setting(&c, "model_quiz")?
-                .unwrap_or_else(|| "openrouter:deepseek/deepseek-v4-flash".into());
-            (exam, context, spec, read_keys(&c)?)
-        };
+    // Load the exam + model config under the lock.
+    let (exam, context, spec, keys) = {
+        let c = state.db.lock().unwrap();
+        let exam = repo::get_exam(&c, id)?;
+        let topics: Vec<String> = exam.topic_ids.clone();
+        let context = exam_context(&c, &exam.subject_id, &topics)?;
+        let spec = repo::get_setting(&c, "model_quiz")?
+            .unwrap_or_else(|| "openrouter:deepseek/deepseek-v4-flash".into());
+        (exam, context, spec, read_keys(&c)?)
+    };
 
-        let questions = exam.questions.as_array().cloned().unwrap_or_default();
-        let ans_by_id: std::collections::HashMap<&str, &ExamAnswer> =
-            answers.iter().map(|a| (a.id.as_str(), a)).collect();
+    let questions = exam.questions.as_array().cloned().unwrap_or_default();
+    let ans_by_id: std::collections::HashMap<&str, &ExamAnswer> =
+        answers.iter().map(|a| (a.id.as_str(), a)).collect();
 
-        // Per-question grading + per-topic tallies. Topic attribution uses the
-        // exam's scoped topic names (best-effort) — when an exam spans topics we
-        // can still surface which were weakest by question index buckets, but the
-        // question JSON has no topic id, so we bucket by the exam's topic list.
-        let mut per_question: Vec<Value> = Vec::with_capacity(questions.len());
-        let mut earned = 0.0f64;
-        let mut total = 0.0f64;
+    // Per-question grading + per-topic tallies. Topic attribution uses the
+    // exam's scoped topic names (best-effort) — when an exam spans topics we
+    // can still surface which were weakest by question index buckets, but the
+    // question JSON has no topic id, so we bucket by the exam's topic list.
+    let mut per_question: Vec<Value> = Vec::with_capacity(questions.len());
+    let mut earned = 0.0f64;
+    let mut total = 0.0f64;
 
-        // Collect written items needing the LLM, plus a parallel index map.
-        let mut written_prompt_items: Vec<Value> = Vec::new();
-        let mut written_meta: Vec<(usize, String, f64)> = Vec::new(); // (q index, id, marks)
+    // Collect written items needing the LLM, plus a parallel index map.
+    let mut written_prompt_items: Vec<Value> = Vec::new();
+    let mut written_meta: Vec<(usize, String, f64)> = Vec::new(); // (q index, id, marks)
 
-        for (qi, q) in questions.iter().enumerate() {
-            let qid = q.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string();
-            let marks = q.get("marks").and_then(|v| v.as_i64()).unwrap_or(1) as f64;
-            total += marks;
-            let qtype = q.get("type").and_then(|v| v.as_str()).unwrap_or("mcq");
-            let given = ans_by_id.get(qid.as_str());
+    for (qi, q) in questions.iter().enumerate() {
+        let qid = q
+            .get("id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let marks = q.get("marks").and_then(|v| v.as_i64()).unwrap_or(1) as f64;
+        total += marks;
+        let qtype = q.get("type").and_then(|v| v.as_str()).unwrap_or("mcq");
+        let given = ans_by_id.get(qid.as_str());
 
-            if qtype == "mcq" {
-                let correct = q.get("correct").and_then(|v| v.as_i64()).unwrap_or(-1);
-                let choice = given.and_then(|a| a.choice);
-                let is_correct = choice == Some(correct);
-                if is_correct {
-                    earned += marks;
-                }
-                per_question.push(json!({
-                    "id": qid,
-                    "type": "mcq",
-                    "marks": marks,
-                    "score": if is_correct { marks } else { 0.0 },
-                    "correct_choice": correct,
-                    "your_choice": choice,
-                    "correct": is_correct,
-                    "feedback": if is_correct { "Correct." } else { "Incorrect." },
-                }));
-            } else {
-                let student = given
-                    .and_then(|a| a.text.as_deref())
-                    .unwrap_or("")
-                    .trim()
-                    .to_string();
-                written_meta.push((qi, qid.clone(), marks));
-                written_prompt_items.push(json!({
-                    "id": qid,
-                    "question": q.get("q").and_then(|v| v.as_str()).unwrap_or(""),
-                    "marks": marks,
-                    "answer": student,
-                }));
-                // placeholder; filled after LLM grading
-                per_question.push(json!({
-                    "id": qid,
-                    "type": "written",
-                    "marks": marks,
-                    "score": 0.0,
-                    "feedback": "",
-                    "your_text": given.and_then(|a| a.text.clone()).unwrap_or_default(),
-                }));
+        if qtype == "mcq" {
+            let correct = q.get("correct").and_then(|v| v.as_i64()).unwrap_or(-1);
+            let choice = given.and_then(|a| a.choice);
+            let is_correct = choice == Some(correct);
+            if is_correct {
+                earned += marks;
             }
+            per_question.push(json!({
+                "id": qid,
+                "type": "mcq",
+                "marks": marks,
+                "score": if is_correct { marks } else { 0.0 },
+                "correct_choice": correct,
+                "your_choice": choice,
+                "correct": is_correct,
+                "feedback": if is_correct { "Correct." } else { "Incorrect." },
+            }));
+        } else {
+            let student = given
+                .and_then(|a| a.text.as_deref())
+                .unwrap_or("")
+                .trim()
+                .to_string();
+            written_meta.push((qi, qid.clone(), marks));
+            written_prompt_items.push(json!({
+                "id": qid,
+                "question": q.get("q").and_then(|v| v.as_str()).unwrap_or(""),
+                "marks": marks,
+                "answer": student,
+            }));
+            // placeholder; filled after LLM grading
+            per_question.push(json!({
+                "id": qid,
+                "type": "written",
+                "marks": marks,
+                "score": 0.0,
+                "feedback": "",
+                "your_text": given.and_then(|a| a.text.clone()).unwrap_or_default(),
+            }));
         }
+    }
 
-        // Which model judged the written answers — surfaced in the results UI so
-        // a bad grade is attributable ("graded by …"). MCQ-only exams are local.
-        let mut graded_by = String::from("local (multiple choice only)");
-        // Grade ALL written answers in a single LLM call (when there are any).
-        if !written_prompt_items.is_empty() {
-            let mut model = llm::from_spec_or_any(&spec, &keys)
-                .ok_or_else(|| Error::Other(NO_MODEL.into()))?;
-            {
-                let c = state.db.lock().unwrap();
-                guard_offline_llm(&c, &spec)?;
-                apply_budget(&mut model, &c, "quiz");
-            }
-            let items_json = serde_json::to_string(&written_prompt_items).unwrap_or_default();
-            // `verify` comes FIRST in the output object on purpose: forcing the
-            // model to quote and check the student's actual claims before it
-            // writes a score measurably cuts misreadings (e.g. accusing the
-            // student of reversing notation they stated correctly).
-            let system =
-                "You are a careful exam grader. You are given SOURCE MATERIAL and a JSON array of \
+    // Which model judged the written answers — surfaced in the results UI so
+    // a bad grade is attributable ("graded by …"). MCQ-only exams are local.
+    let mut graded_by = String::from("local (multiple choice only)");
+    // Grade ALL written answers in a single LLM call (when there are any).
+    if !written_prompt_items.is_empty() {
+        let mut model =
+            llm::from_spec_or_any(&spec, &keys).ok_or_else(|| Error::Other(NO_MODEL.into()))?;
+        {
+            let c = state.db.lock().unwrap();
+            guard_offline_llm(&c, &spec)?;
+            apply_budget(&mut model, &c, "quiz");
+        }
+        let items_json = serde_json::to_string(&written_prompt_items).unwrap_or_default();
+        // `verify` comes FIRST in the output object on purpose: forcing the
+        // model to quote and check the student's actual claims before it
+        // writes a score measurably cuts misreadings (e.g. accusing the
+        // student of reversing notation they stated correctly).
+        let system =
+            "You are a careful exam grader. You are given SOURCE MATERIAL and a JSON array of \
                  written answers, each {id, question, marks, answer}. For EACH item, FIRST verify: \
                  in 1-3 sentences, restate the factual claims the student ACTUALLY made — quote \
                  their wording; NEVER attribute to the student anything they did not write — and \
@@ -390,120 +400,117 @@ fn grade_exam_inner(app: &AppHandle, id: &str, answers: &[ExamAnswer]) -> Result
                  Respond with ONLY a raw JSON array \
                  [{\"id\":\"...\",\"verify\":\"...\",\"score\":<number>,\"feedback\":\"...\"}], \
                  one entry per item, same ids, fields in that order. No prose, no code fences.";
-            let user = format!(
-                "SOURCE MATERIAL:\n{context}\n\nANSWERS TO GRADE (JSON):\n{items_json}\n\nGrade now."
+        let user = format!(
+            "SOURCE MATERIAL:\n{context}\n\nANSWERS TO GRADE (JSON):\n{items_json}\n\nGrade now."
+        );
+        graded_by = model.name();
+        // A truncated grading reply is worthless: enforce a generous output
+        // floor regardless of the user's budget sliders (the verify field
+        // makes replies longer, and a mid-array cutoff is exactly what
+        // produced the "grading is temporarily unavailable" zeros).
+        let floor = 2048 + 700 * written_prompt_items.len() as u32;
+        model.set_max_tokens(floor.max(4096));
+        let mut raw = model.complete(system, &user)?;
+        if llm::extract_json(&raw).is_err() {
+            eprintln!(
+                "[exam] grading reply unparseable (model {}), retrying once: {}",
+                graded_by,
+                raw.chars().take(300).collect::<String>()
             );
-            graded_by = model.name();
-            // A truncated grading reply is worthless: enforce a generous output
-            // floor regardless of the user's budget sliders (the verify field
-            // makes replies longer, and a mid-array cutoff is exactly what
-            // produced the "grading is temporarily unavailable" zeros).
-            let floor = 2048 + 700 * written_prompt_items.len() as u32;
-            model.set_max_tokens(floor.max(4096));
-            let mut raw = model.complete(system, &user)?;
-            if llm::extract_json(&raw).is_err() {
-                eprintln!(
-                    "[exam] grading reply unparseable (model {}), retrying once: {}",
-                    graded_by,
-                    raw.chars().take(300).collect::<String>()
-                );
-                raw = model.complete(
-                    system,
-                    &format!(
-                        "{user}\n\nIMPORTANT: your previous reply could not be parsed. \
+            raw = model.complete(
+                system,
+                &format!(
+                    "{user}\n\nIMPORTANT: your previous reply could not be parsed. \
                          Respond with ONLY the raw JSON array — no thinking, no prose, \
                          no code fences, starting with [ and ending with ]."
-                    ),
-                )?;
-            }
-            // Best-effort: if grading JSON is unusable, written items score 0 with a
-            // note rather than failing the whole submission.
-            if let Ok(graded) = llm::extract_json(&raw) {
-                let by_id: std::collections::HashMap<String, &Value> = graded
-                    .as_array()
-                    .map(|a| {
-                        a.iter()
-                            .filter_map(|g| {
-                                g.get("id")
-                                    .and_then(|v| v.as_str())
-                                    .map(|s| (s.to_string(), g))
-                            })
-                            .collect()
-                    })
-                    .unwrap_or_default();
-                for (qi, qid, marks) in &written_meta {
-                    if let Some(g) = by_id.get(qid) {
-                        let raw_score = g.get("score").and_then(|v| v.as_f64()).unwrap_or(0.0);
-                        let score = raw_score.clamp(0.0, *marks);
-                        let feedback = g
-                            .get("feedback")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("")
-                            .to_string();
-                        earned += score;
-                        if let Some(obj) = per_question[*qi].as_object_mut() {
-                            obj.insert("score".into(), json!(score));
-                            obj.insert("feedback".into(), json!(feedback));
-                        }
-                    } else if let Some(obj) = per_question[*qi].as_object_mut() {
-                        obj.insert(
-                            "feedback".into(),
-                            json!("Could not grade this answer automatically."),
-                        );
-                    }
-                }
-            } else {
-                eprintln!("[exam] grading reply unparseable after retry (model {graded_by})");
-                for (qi, _, _) in &written_meta {
+                ),
+            )?;
+        }
+        // Best-effort: if grading JSON is unusable, written items score 0 with a
+        // note rather than failing the whole submission.
+        if let Ok(graded) = llm::extract_json(&raw) {
+            let by_id: std::collections::HashMap<String, &Value> = graded
+                .as_array()
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|g| {
+                            g.get("id")
+                                .and_then(|v| v.as_str())
+                                .map(|s| (s.to_string(), g))
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            for (qi, qid, marks) in &written_meta {
+                if let Some(g) = by_id.get(qid) {
+                    let raw_score = g.get("score").and_then(|v| v.as_f64()).unwrap_or(0.0);
+                    let score = raw_score.clamp(0.0, *marks);
+                    let feedback = g
+                        .get("feedback")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    earned += score;
                     if let Some(obj) = per_question[*qi].as_object_mut() {
-                        obj.insert(
-                            "feedback".into(),
-                            json!(format!(
-                                "The grading model ({graded_by}) returned an unreadable reply twice — \
+                        obj.insert("score".into(), json!(score));
+                        obj.insert("feedback".into(), json!(feedback));
+                    }
+                } else if let Some(obj) = per_question[*qi].as_object_mut() {
+                    obj.insert(
+                        "feedback".into(),
+                        json!("Could not grade this answer automatically."),
+                    );
+                }
+            }
+        } else {
+            eprintln!("[exam] grading reply unparseable after retry (model {graded_by})");
+            for (qi, _, _) in &written_meta {
+                if let Some(obj) = per_question[*qi].as_object_mut() {
+                    obj.insert(
+                        "feedback".into(),
+                        json!(format!(
+                            "The grading model ({graded_by}) returned an unreadable reply twice — \
                                  not graded. Press Remark to retry, or switch the Quiz model in \
                                  Settings → Models."
-                            )),
-                        );
-                    }
+                        )),
+                    );
                 }
             }
         }
+    }
 
-        let percent = if total > 0.0 {
-            (earned / total * 100.0 * 10.0).round() / 10.0
-        } else {
-            0.0
-        };
+    let percent = if total > 0.0 {
+        (earned / total * 100.0 * 10.0).round() / 10.0
+    } else {
+        0.0
+    };
 
-        // Per-topic breakdown: when the exam is scoped to named topics, surface
-        // each topic's name so the UI can flag the weakest. With a single scope we
-        // still report it so the callout always has something to show.
-        let topics = topic_names_for(&state, &exam);
-        let topic_breakdown: Vec<Value> = topics
-            .iter()
-            .map(|name| json!({ "topic": name }))
-            .collect();
+    // Per-topic breakdown: when the exam is scoped to named topics, surface
+    // each topic's name so the UI can flag the weakest. With a single scope we
+    // still report it so the callout always has something to show.
+    let topics = topic_names_for(&state, &exam);
+    let topic_breakdown: Vec<Value> = topics.iter().map(|name| json!({ "topic": name })).collect();
 
-        let results = json!({
-            "score": percent,
-            "earned": earned,
-            "total": total,
-            "questions": per_question,
-            "topics": topic_breakdown,
-            "graded_by": graded_by,
-        });
+    let results = json!({
+        "score": percent,
+        "earned": earned,
+        "total": total,
+        "questions": per_question,
+        "topics": topic_breakdown,
+        "graded_by": graded_by,
+    });
 
-        // Persist the answers verbatim alongside the grading.
-        let answers_json = json!(answers
-            .iter()
-            .map(|a| json!({ "id": a.id, "choice": a.choice, "text": a.text }))
-            .collect::<Vec<_>>());
+    // Persist the answers verbatim alongside the grading.
+    let answers_json = json!(answers
+        .iter()
+        .map(|a| json!({ "id": a.id, "choice": a.choice, "text": a.text }))
+        .collect::<Vec<_>>());
 
-        {
-            let c = state.db.lock().unwrap();
-            repo::finalize_exam(&c, id, &answers_json, &results, percent)?;
-        }
-        Ok(results)
+    {
+        let c = state.db.lock().unwrap();
+        repo::finalize_exam(&c, id, &answers_json, &results, percent)?;
+    }
+    Ok(results)
 }
 
 /// The exam's scoped topic names (empty scope → all subject topics). Best-effort:

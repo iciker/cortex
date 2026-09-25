@@ -26,9 +26,12 @@ use base64::Engine as _;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::Arc;
-use tokio::sync::broadcast;
+use tokio::io::AsyncWriteExt;
+use tokio::sync::{broadcast, Mutex};
 
 struct App {
+    // ponytail: one vault, one commit lock; split per vault if multi-tenancy is added.
+    commit: Mutex<()>,
     data: PathBuf,
     seq: AtomicI64,
     snapshot_seq: AtomicI64,
@@ -39,6 +42,25 @@ struct App {
 
 fn delta_path(data: &std::path::Path, seq: i64) -> PathBuf {
     data.join("deltas").join(format!("{seq:012}.db"))
+}
+
+fn snapshot_path(data: &std::path::Path, seq: i64) -> PathBuf {
+    data.join(format!("snapshot-{seq:012}.db"))
+}
+
+async fn atomic_write(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
+    let tmp = path.with_extension("tmp");
+    let mut file = tokio::fs::File::create(&tmp).await?;
+    file.write_all(bytes).await?;
+    file.sync_all().await?;
+    drop(file);
+    tokio::fs::rename(tmp, path).await?;
+    #[cfg(unix)]
+    tokio::fs::File::open(path.parent().unwrap())
+        .await?
+        .sync_all()
+        .await?;
+    Ok(())
 }
 
 fn list_delta_seqs(data: &std::path::Path) -> Vec<i64> {
@@ -63,15 +85,24 @@ fn check_auth(app: &App, headers: &HeaderMap) -> bool {
     if app.user.is_empty() && app.pass.is_empty() {
         return true; // auth disabled (LAN-only setups)
     }
-    let Some(v) = headers.get(header::AUTHORIZATION).and_then(|v| v.to_str().ok()) else {
+    let Some(v) = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+    else {
         return false;
     };
-    let Some(b64) = v.strip_prefix("Basic ") else { return false };
+    let Some(b64) = v.strip_prefix("Basic ") else {
+        return false;
+    };
     let Ok(raw) = base64::engine::general_purpose::STANDARD.decode(b64) else {
         return false;
     };
-    let Ok(s) = String::from_utf8(raw) else { return false };
-    let Some((u, p)) = s.split_once(':') else { return false };
+    let Ok(s) = String::from_utf8(raw) else {
+        return false;
+    };
+    let Some((u, p)) = s.split_once(':') else {
+        return false;
+    };
     u == app.user && p == app.pass
 }
 
@@ -98,6 +129,7 @@ async fn get_seq(State(app): State<Arc<App>>, headers: HeaderMap) -> Response {
     if !check_auth(&app, &headers) {
         return unauthorized();
     }
+    let _commit = app.commit.lock().await;
     axum::Json(serde_json::json!({
         "seq": app.seq.load(Ordering::SeqCst),
         "snapshot_seq": app.snapshot_seq.load(Ordering::SeqCst),
@@ -116,17 +148,15 @@ async fn post_delta(
     if body.is_empty() {
         return (StatusCode::BAD_REQUEST, "empty delta").into_response();
     }
-    // Assign the next seq and persist atomically (tmp + rename) so a crashed
-    // write can never surface a half-delta to peers.
-    let seq = app.seq.fetch_add(1, Ordering::SeqCst) + 1;
+    let _commit = app.commit.lock().await;
+    let Some(seq) = app.seq.load(Ordering::SeqCst).checked_add(1) else {
+        return StatusCode::INSUFFICIENT_STORAGE.into_response();
+    };
     let path = delta_path(&app.data, seq);
-    let tmp = path.with_extension("tmp");
-    if let Err(e) = tokio::fs::write(&tmp, &body).await {
+    if let Err(e) = atomic_write(&path, &body).await {
         return (StatusCode::INTERNAL_SERVER_ERROR, format!("write: {e}")).into_response();
     }
-    if let Err(e) = tokio::fs::rename(&tmp, &path).await {
-        return (StatusCode::INTERNAL_SERVER_ERROR, format!("rename: {e}")).into_response();
-    }
+    app.seq.store(seq, Ordering::SeqCst);
     let _ = app.tx.send(seq); // push to every connected peer
     axum::Json(serde_json::json!({ "seq": seq })).into_response()
 }
@@ -139,8 +169,12 @@ async fn list_deltas(
     if !check_auth(&app, &headers) {
         return unauthorized();
     }
+    let _commit = app.commit.lock().await;
     let since = q.since.unwrap_or(0);
-    let seqs: Vec<i64> = list_delta_seqs(&app.data).into_iter().filter(|s| *s > since).collect();
+    let seqs: Vec<i64> = list_delta_seqs(&app.data)
+        .into_iter()
+        .filter(|s| *s > since && *s <= app.seq.load(Ordering::SeqCst))
+        .collect();
     axum::Json(serde_json::json!({ "seqs": seqs })).into_response()
 }
 
@@ -177,16 +211,28 @@ async fn put_snapshot(
     if body.is_empty() {
         return (StatusCode::BAD_REQUEST, "empty snapshot").into_response();
     }
-    let seq = q.seq.unwrap_or_else(|| app.seq.load(Ordering::SeqCst));
-    let snap = app.data.join("snapshot.db");
-    let tmp = snap.with_extension("tmp");
-    if let Err(e) = tokio::fs::write(&tmp, &body).await {
+    let _commit = app.commit.lock().await;
+    let Some(seq) = q
+        .seq
+        .filter(|s| *s > 0 && *s <= app.seq.load(Ordering::SeqCst))
+    else {
+        return (
+            StatusCode::BAD_REQUEST,
+            "snapshot must name a committed sequence",
+        )
+            .into_response();
+    };
+    let previous = app.snapshot_seq.load(Ordering::SeqCst);
+    if seq <= previous {
+        return (StatusCode::CONFLICT, "snapshot is not newer").into_response();
+    }
+    // Immutable body first, then a durable pointer: a crash cannot relabel old bytes.
+    if let Err(e) = atomic_write(&snapshot_path(&app.data, seq), &body).await {
         return (StatusCode::INTERNAL_SERVER_ERROR, format!("write: {e}")).into_response();
     }
-    if let Err(e) = tokio::fs::rename(&tmp, &snap).await {
-        return (StatusCode::INTERNAL_SERVER_ERROR, format!("rename: {e}")).into_response();
+    if let Err(e) = atomic_write(&app.data.join("snapshot.seq"), seq.to_string().as_bytes()).await {
+        return (StatusCode::INTERNAL_SERVER_ERROR, format!("pointer: {e}")).into_response();
     }
-    let _ = tokio::fs::write(app.data.join("snapshot.seq"), seq.to_string()).await;
     app.snapshot_seq.store(seq, Ordering::SeqCst);
     // Compaction: everything the snapshot already contains can go.
     for s in list_delta_seqs(&app.data) {
@@ -194,6 +240,8 @@ async fn put_snapshot(
             let _ = tokio::fs::remove_file(delta_path(&app.data, s)).await;
         }
     }
+    let _ = tokio::fs::remove_file(snapshot_path(&app.data, previous)).await;
+    let _ = tokio::fs::remove_file(app.data.join("snapshot.db")).await;
     axum::Json(serde_json::json!({ "seq": seq })).into_response()
 }
 
@@ -201,14 +249,23 @@ async fn get_snapshot(State(app): State<Arc<App>>, headers: HeaderMap) -> Respon
     if !check_auth(&app, &headers) {
         return unauthorized();
     }
-    match tokio::fs::read(app.data.join("snapshot.db")).await {
+    let _commit = app.commit.lock().await;
+    let seq = app.snapshot_seq.load(Ordering::SeqCst);
+    let path = snapshot_path(&app.data, seq);
+    // Read snapshots written by older syncd releases until the next compaction.
+    let path = if path.exists() {
+        path
+    } else {
+        app.data.join("snapshot.db")
+    };
+    match tokio::fs::read(path).await {
         Ok(bytes) => (
             StatusCode::OK,
             [
                 (header::CONTENT_TYPE, "application/octet-stream".to_string()),
                 (
                     header::HeaderName::from_static("x-snapshot-seq"),
-                    app.snapshot_seq.load(Ordering::SeqCst).to_string(),
+                    seq.to_string(),
                 ),
             ],
             bytes,
@@ -271,7 +328,15 @@ fn build_app(data: PathBuf, user: String, pass: String) -> Arc<App> {
         .and_then(|s| s.trim().parse().ok())
         .unwrap_or(0);
     let (tx, _) = broadcast::channel(256);
-    Arc::new(App { data, seq: AtomicI64::new(seq), snapshot_seq: AtomicI64::new(snapshot_seq), tx, user, pass })
+    Arc::new(App {
+        commit: Mutex::new(()),
+        data,
+        seq: AtomicI64::new(seq.max(snapshot_seq)),
+        snapshot_seq: AtomicI64::new(snapshot_seq),
+        tx,
+        user,
+        pass,
+    })
 }
 
 fn router(app: Arc<App>) -> Router {
@@ -282,7 +347,9 @@ fn router(app: Arc<App>) -> Router {
         .route("/snapshot", put(put_snapshot).get(get_snapshot))
         .route("/ws", get(ws_handler))
         // Vaults with big libraries still fit comfortably; reject absurdity.
-        .layer(tower_http::limit::RequestBodyLimitLayer::new(2 * 1024 * 1024 * 1024))
+        .layer(tower_http::limit::RequestBodyLimitLayer::new(
+            2 * 1024 * 1024 * 1024,
+        ))
         .with_state(app)
 }
 
@@ -292,11 +359,18 @@ async fn main() {
     let user = std::env::var("SYNC_USER").unwrap_or_default();
     let pass = std::env::var("SYNC_PASSWORD").unwrap_or_default();
     if user.is_empty() && pass.is_empty() {
-        eprintln!("syncd: WARNING — SYNC_USER/SYNC_PASSWORD unset, running UNAUTHENTICATED (LAN-only!)");
+        eprintln!(
+            "syncd: WARNING — SYNC_USER/SYNC_PASSWORD unset, running UNAUTHENTICATED (LAN-only!)"
+        );
     }
-    let port: u16 = std::env::var("SYNCD_PORT").ok().and_then(|p| p.parse().ok()).unwrap_or(8787);
+    let port: u16 = std::env::var("SYNCD_PORT")
+        .ok()
+        .and_then(|p| p.parse().ok())
+        .unwrap_or(8787);
     let app = build_app(data, user, pass);
-    let listener = tokio::net::TcpListener::bind(("0.0.0.0", port)).await.expect("bind");
+    let listener = tokio::net::TcpListener::bind(("0.0.0.0", port))
+        .await
+        .expect("bind");
     eprintln!("cortex-syncd listening on :{port}");
     axum::serve(listener, router(app)).await.expect("serve");
 }
@@ -308,9 +382,15 @@ mod tests {
 
     async fn spawn_server(auth: bool) -> (String, tempdir::TempDirGuard) {
         let dir = tempdir::guard();
-        let (user, pass) = if auth { ("u".into(), "p".into()) } else { (String::new(), String::new()) };
+        let (user, pass) = if auth {
+            ("u".into(), "p".into())
+        } else {
+            (String::new(), String::new())
+        };
         let app = build_app(dir.path.clone(), user, pass);
-        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move { axum::serve(listener, router(app)).await.unwrap() });
         (format!("http://{addr}"), dir)
@@ -327,9 +407,11 @@ mod tests {
             }
         }
         pub fn guard() -> TempDirGuard {
+            static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
             let path = std::env::temp_dir().join(format!(
-                "syncd-test-{}-{:x}",
+                "syncd-test-{}-{}-{:x}",
                 std::process::id(),
+                NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
                 std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .unwrap()
@@ -353,23 +435,45 @@ mod tests {
         assert!(hello.contains("\"seq\":0"), "greeting: {hello}");
 
         // Push a delta.
-        let r = http.post(format!("{base}/deltas")).body(b"delta-one".to_vec()).send().await.unwrap();
-        assert_eq!(r.status(), 200);
-        let seq = r.json::<serde_json::Value>().await.unwrap()["seq"].as_i64().unwrap();
+        let r = http
+            .post(format!("{base}/deltas"))
+            .body(b"delta-one".to_vec())
+            .send()
+            .await
+            .unwrap();
+        if !r.status().is_success() {
+            panic!("delta failed: {}", r.text().await.unwrap());
+        }
+        let seq = r.json::<serde_json::Value>().await.unwrap()["seq"]
+            .as_i64()
+            .unwrap();
         assert_eq!(seq, 1);
 
         // WS got the push.
         let pushed = ws.next().await.unwrap().unwrap().into_text().unwrap();
         assert!(pushed.contains("\"seq\":1"), "pushed: {pushed}");
-        ws.send(tokio_tungstenite::tungstenite::Message::Close(None)).await.ok();
+        ws.send(tokio_tungstenite::tungstenite::Message::Close(None))
+            .await
+            .ok();
 
         // Catch-up listing + fetch.
         let seqs = http
             .get(format!("{base}/deltas?since=0"))
-            .send().await.unwrap()
-            .json::<serde_json::Value>().await.unwrap();
+            .send()
+            .await
+            .unwrap()
+            .json::<serde_json::Value>()
+            .await
+            .unwrap();
         assert_eq!(seqs["seqs"], serde_json::json!([1]));
-        let body = http.get(format!("{base}/deltas/1")).send().await.unwrap().bytes().await.unwrap();
+        let body = http
+            .get(format!("{base}/deltas/1"))
+            .send()
+            .await
+            .unwrap()
+            .bytes()
+            .await
+            .unwrap();
         assert_eq!(&body[..], b"delta-one");
     }
 
@@ -378,13 +482,28 @@ mod tests {
         let (base, dir) = spawn_server(false).await;
         let http = reqwest::Client::new();
         for i in 0..3 {
-            http.post(format!("{base}/deltas")).body(format!("d{i}")).send().await.unwrap();
+            http.post(format!("{base}/deltas"))
+                .body(format!("d{i}"))
+                .send()
+                .await
+                .unwrap();
         }
         // Snapshot at seq 2 → deltas 1,2 pruned, 3 kept.
-        let r = http.put(format!("{base}/snapshot?seq=2")).body(b"snap".to_vec()).send().await.unwrap();
+        let r = http
+            .put(format!("{base}/snapshot?seq=2"))
+            .body(b"snap".to_vec())
+            .send()
+            .await
+            .unwrap();
         assert_eq!(r.status(), 200);
-        let seqs = http.get(format!("{base}/deltas?since=0")).send().await.unwrap()
-            .json::<serde_json::Value>().await.unwrap();
+        let seqs = http
+            .get(format!("{base}/deltas?since=0"))
+            .send()
+            .await
+            .unwrap()
+            .json::<serde_json::Value>()
+            .await
+            .unwrap();
         assert_eq!(seqs["seqs"], serde_json::json!([3]));
         let snap = http.get(format!("{base}/snapshot")).send().await.unwrap();
         assert_eq!(snap.headers()["x-snapshot-seq"], "2");
@@ -397,14 +516,144 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn stale_or_uncommitted_snapshots_cannot_replace_the_latest() {
+        let (base, dir) = spawn_server(false).await;
+        let http = reqwest::Client::new();
+        for _ in 0..3 {
+            http.post(format!("{base}/deltas"))
+                .body("delta")
+                .send()
+                .await
+                .unwrap()
+                .error_for_status()
+                .unwrap();
+        }
+        assert_eq!(
+            http.put(format!("{base}/snapshot?seq=3"))
+                .body("latest")
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            200
+        );
+        for suffix in ["?seq=1", "?seq=3", "?seq=4", ""] {
+            assert!(http
+                .put(format!("{base}/snapshot{suffix}"))
+                .body("stale")
+                .send()
+                .await
+                .unwrap()
+                .status()
+                .is_client_error());
+        }
+        // A crash after persisting a new body but before publishing its pointer
+        // must leave the previous snapshot readable after restart.
+        std::fs::write(snapshot_path(&dir.path, 4), "unpublished").unwrap();
+        let app = build_app(dir.path.clone(), String::new(), String::new());
+        assert_eq!(app.snapshot_seq.load(Ordering::SeqCst), 3);
+        let response = get_snapshot(State(app), HeaderMap::new()).await;
+        assert_eq!(response.headers()["x-snapshot-seq"], "3");
+        assert_eq!(
+            &axum::body::to_bytes(response.into_body(), 100)
+                .await
+                .unwrap()[..],
+            b"latest"
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_delta_write_does_not_consume_sequence() {
+        let (base, dir) = spawn_server(false).await;
+        let http = reqwest::Client::new();
+        let blocked = delta_path(&dir.path, 1).with_extension("tmp");
+        std::fs::create_dir(&blocked).unwrap();
+        assert_eq!(
+            http.post(format!("{base}/deltas"))
+                .body("failed")
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            500
+        );
+        std::fs::remove_dir(blocked).unwrap();
+        let result = http
+            .post(format!("{base}/deltas"))
+            .body("ok")
+            .send()
+            .await
+            .unwrap()
+            .json::<serde_json::Value>()
+            .await
+            .unwrap();
+        assert_eq!(result["seq"], 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_uploads_publish_only_a_contiguous_durable_log() {
+        let (base, _dir) = spawn_server(false).await;
+        let mut tasks = tokio::task::JoinSet::new();
+        for i in 0..24 {
+            let base = base.clone();
+            tasks.spawn(async move {
+                let http = reqwest::Client::new();
+                let ack = http
+                    .post(format!("{base}/deltas"))
+                    .body(format!("delta-{i}"))
+                    .send()
+                    .await
+                    .unwrap()
+                    .json::<serde_json::Value>()
+                    .await
+                    .unwrap();
+                let seq = ack["seq"].as_i64().unwrap();
+                let listed = http
+                    .get(format!("{base}/deltas"))
+                    .send()
+                    .await
+                    .unwrap()
+                    .json::<serde_json::Value>()
+                    .await
+                    .unwrap();
+                let seqs: Vec<i64> = listed["seqs"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|v| v.as_i64().unwrap())
+                    .collect();
+                assert!(seqs.len() >= seq as usize);
+                assert_eq!(seqs, (1..=seqs.len() as i64).collect::<Vec<_>>());
+                seq
+            });
+        }
+        let mut acknowledged = Vec::new();
+        while let Some(result) = tasks.join_next().await {
+            acknowledged.push(result.unwrap());
+        }
+        acknowledged.sort_unstable();
+        assert_eq!(acknowledged, (1..=24).collect::<Vec<_>>());
+    }
+
+    #[tokio::test]
     async fn auth_is_enforced_when_configured() {
         let (base, _dir) = spawn_server(true).await;
         let http = reqwest::Client::new();
         let r = http.get(format!("{base}/seq")).send().await.unwrap();
         assert_eq!(r.status(), 401);
-        let r = http.get(format!("{base}/seq")).basic_auth("u", Some("p")).send().await.unwrap();
+        let r = http
+            .get(format!("{base}/seq"))
+            .basic_auth("u", Some("p"))
+            .send()
+            .await
+            .unwrap();
         assert_eq!(r.status(), 200);
-        let r = http.get(format!("{base}/seq")).basic_auth("u", Some("wrong")).send().await.unwrap();
+        let r = http
+            .get(format!("{base}/seq"))
+            .basic_auth("u", Some("wrong"))
+            .send()
+            .await
+            .unwrap();
         assert_eq!(r.status(), 401);
     }
 }

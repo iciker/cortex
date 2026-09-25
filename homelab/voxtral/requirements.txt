@@ -1,0 +1,6 @@
+mlx-audio[server] @ git+https://github.com/Blaizzy/mlx-audio.git@17001a6950956302f15b53d86b601324efe716ba
+mlx==0.32.2
+fastapi==0.141.1
+uvicorn[standard]==0.52.4
+websockets==16.0
+huggingface-hub>=1.5.0,<2

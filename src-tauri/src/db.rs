@@ -34,6 +34,7 @@ const MIGRATIONS: &[&str] = &[
     include_str!("../migrations/0027_google_event_tombstone.sql"),
     include_str!("../migrations/0028_cheatsheet_tombstone.sql"),
     include_str!("../migrations/0029_source_diarize.sql"),
+    include_str!("../migrations/0030_sync_content_timestamps.sql"),
 ];
 
 /// Shared application state: a single SQLite connection behind a Mutex.
@@ -51,8 +52,15 @@ fn register_sqlite_vec() {
     use std::sync::Once;
     static VEC_INIT: Once = Once::new();
     VEC_INIT.call_once(|| unsafe {
-        rusqlite::ffi::sqlite3_auto_extension(Some(std::mem::transmute(
-            sqlite_vec::sqlite3_vec_init as *const (),
+        rusqlite::ffi::sqlite3_auto_extension(Some(std::mem::transmute::<
+            *const (),
+            unsafe extern "C" fn(
+                *mut rusqlite::ffi::sqlite3,
+                *mut *mut std::ffi::c_char,
+                *const rusqlite::ffi::sqlite3_api_routines,
+            ) -> std::ffi::c_int,
+        >(
+            sqlite_vec::sqlite3_vec_init as *const ()
         )));
     });
 }
@@ -84,13 +92,14 @@ impl AppState {
 
 /// Apply any migrations whose index is beyond the current `user_version`.
 fn run_migrations(conn: &Connection) -> Result<()> {
-    let mut version: i64 =
-        conn.pragma_query_value(None, "user_version", |r| r.get(0))?;
+    let mut version: i64 = conn.pragma_query_value(None, "user_version", |r| r.get(0))?;
     while (version as usize) < MIGRATIONS.len() {
         let sql = MIGRATIONS[version as usize];
-        conn.execute_batch(sql)?;
+        let tx = conn.unchecked_transaction()?;
+        tx.execute_batch(sql)?;
         version += 1;
-        conn.pragma_update(None, "user_version", version)?;
+        tx.pragma_update(None, "user_version", version)?;
+        tx.commit()?;
     }
     Ok(())
 }
@@ -127,8 +136,14 @@ mod tests {
         let orth: f64 = conn
             .query_row("SELECT vec_distance_cosine(?1, ?2)", [&a, &b], |r| r.get(0))
             .unwrap();
-        assert!(same.abs() < 1e-5, "identical vectors distance ~0, got {same}");
-        assert!((orth - 1.0).abs() < 1e-5, "orthogonal vectors distance ~1, got {orth}");
+        assert!(
+            same.abs() < 1e-5,
+            "identical vectors distance ~0, got {same}"
+        );
+        assert!(
+            (orth - 1.0).abs() < 1e-5,
+            "orthogonal vectors distance ~1, got {orth}"
+        );
     }
 
     #[test]
@@ -148,5 +163,51 @@ mod tests {
             )
             .unwrap();
         assert_eq!(n, 1);
+    }
+}
+
+#[cfg(test)]
+mod sync_migration_regressions {
+    use super::*;
+
+    #[test]
+    fn upgrade_preserves_legacy_content_and_failed_migration_is_retryable() {
+        let c = Connection::open_in_memory().unwrap();
+        for sql in &MIGRATIONS[..29] {
+            c.execute_batch(sql).unwrap();
+        }
+        c.pragma_update(None, "user_version", 29).unwrap();
+        c.execute_batch("INSERT INTO subjects(id,name,created_at,updated_at) VALUES('s','Course',1,2);
+            INSERT INTO materials(id,subject_id,kind,title,created_at) VALUES('m','s','quiz','Kept',3);
+            INSERT INTO cheatsheets(id,subject_id,created_at,updated_at) VALUES('c','s',4,5);
+            INSERT INTO cheatsheet_sections(id,cheatsheet_id,title,body) VALUES('sec','c','Kept section','[]');
+            INSERT INTO settings(key,value) VALUES('livesync_pushed_at','999');
+            CREATE TRIGGER reject_reset BEFORE DELETE ON settings BEGIN SELECT RAISE(ABORT,'test failure'); END;").unwrap();
+        assert!(run_migrations(&c).is_err());
+        let version: i64 = c
+            .pragma_query_value(None, "user_version", |r| r.get(0))
+            .unwrap();
+        assert_eq!(version, 29);
+        assert!(c.prepare("SELECT updated_at FROM materials").is_err());
+        c.execute_batch("DROP TRIGGER reject_reset").unwrap();
+        run_migrations(&c).unwrap();
+        run_migrations(&c).unwrap();
+        let material: (String, i64) = c
+            .query_row("SELECT title,updated_at FROM materials", [], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })
+            .unwrap();
+        assert_eq!(material, ("Kept".into(), 3));
+        let section: (String, i64) = c
+            .query_row(
+                "SELECT title,updated_at FROM cheatsheet_sections",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(section, ("Kept section".into(), 5));
+        assert!(crate::repo::get_setting(&c, "livesync_pushed_at")
+            .unwrap()
+            .is_none());
     }
 }

@@ -133,7 +133,12 @@ pub fn html_to_text(html: &str) -> String {
     // Drop zero-width / BOM characters that make extracted web text look garbled.
     let text: String = text
         .chars()
-        .filter(|&c| !matches!(c, '\u{200b}' | '\u{200c}' | '\u{200d}' | '\u{feff}' | '\u{ad}'))
+        .filter(|&c| {
+            !matches!(
+                c,
+                '\u{200b}' | '\u{200c}' | '\u{200d}' | '\u{feff}' | '\u{ad}'
+            )
+        })
         .collect();
     let re_ws = WS_RE.get_or_init(|| regex::Regex::new(r"\s+").unwrap());
     re_ws.replace_all(text.trim(), " ").to_string()
@@ -154,7 +159,8 @@ pub fn readable_page(html: &str, base_url: &str) -> (String, String, Vec<(String
     let text = html_to_text(html);
 
     // Outbound links: <a href="…">text</a>, resolved to absolute http(s) URLs.
-    let re_a = regex::Regex::new(r#"(?is)<a\b[^>]*href\s*=\s*["']([^"']+)["'][^>]*>(.*?)</a>"#).unwrap();
+    let re_a =
+        regex::Regex::new(r#"(?is)<a\b[^>]*href\s*=\s*["']([^"']+)["'][^>]*>(.*?)</a>"#).unwrap();
     let mut links: Vec<(String, String)> = Vec::new();
     let mut seen = std::collections::HashSet::new();
     for caps in re_a.captures_iter(html) {
@@ -193,7 +199,11 @@ fn resolve_url(base: &str, href: &str) -> String {
     let scheme = &base[..scheme_end]; // includes "://"
     let host = after.split(['/', '?', '#']).next().unwrap_or(after);
     if let Some(rest) = href.strip_prefix("//") {
-        let s = if scheme.is_empty() { "https://" } else { scheme };
+        let s = if scheme.is_empty() {
+            "https://"
+        } else {
+            scheme
+        };
         return format!("{s}{rest}");
     }
     if let Some(path) = href.strip_prefix('/') {
@@ -201,7 +211,10 @@ fn resolve_url(base: &str, href: &str) -> String {
     }
     // relative to the current directory of the base path
     let base_no_query = base.split(['?', '#']).next().unwrap_or(base);
-    let dir = base_no_query.rsplit_once('/').map(|(d, _)| d).unwrap_or(base_no_query);
+    let dir = base_no_query
+        .rsplit_once('/')
+        .map(|(d, _)| d)
+        .unwrap_or(base_no_query);
     format!("{dir}/{href}")
 }
 
@@ -231,7 +244,9 @@ fn decode_entities(s: &str) -> String {
             } else {
                 raw.parse::<u32>().ok()
             };
-            code.and_then(char::from_u32).map(|c| c.to_string()).unwrap_or_default()
+            code.and_then(char::from_u32)
+                .map(|c| c.to_string())
+                .unwrap_or_default()
         })
         .into_owned()
 }
@@ -272,7 +287,9 @@ fn pdf_to_text(path: &str) -> Result<(String, Option<String>)> {
             Ok(o) => {
                 let stderr = String::from_utf8_lossy(&o.stderr).trim().to_string();
                 if !stderr.is_empty() {
-                    return Err(Error::Other(format!("pdftotext failed for {path}: {stderr}")));
+                    return Err(Error::Other(format!(
+                        "pdftotext failed for {path}: {stderr}"
+                    )));
                 }
             }
             Err(_) => {} // binary vanished between which() and exec → try pure-Rust
@@ -323,7 +340,10 @@ fn libreoffice_to_text(path: &str) -> Result<(String, Option<String>)> {
         std::fs::create_dir_all(&tmp)?;
         let pdf = tmp.join("deck.pdf");
         let res = libreoffice_to_pdf(path, &pdf).and_then(|_| {
-            pdf_to_text(pdf.to_str().ok_or_else(|| Error::Other("bad temp path".into()))?)
+            pdf_to_text(
+                pdf.to_str()
+                    .ok_or_else(|| Error::Other("bad temp path".into()))?,
+            )
         });
         let _ = std::fs::remove_dir_all(&tmp);
         return res;
@@ -523,7 +543,9 @@ pub fn epub_to_text(path: &str) -> Result<(String, Option<String>)> {
         let attr = |tag: &str, want: &str| {
             static ATTR_RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
             ATTR_RE
-                .get_or_init(|| regex::Regex::new(r#"(?is)([\w:-]+)\s*=\s*["']([^"']*)["']"#).unwrap())
+                .get_or_init(|| {
+                    regex::Regex::new(r#"(?is)([\w:-]+)\s*=\s*["']([^"']*)["']"#).unwrap()
+                })
                 .captures_iter(tag)
                 .find(|c| c[1].eq_ignore_ascii_case(want))
                 .map(|c| c[2].to_string())
@@ -532,7 +554,10 @@ pub fn epub_to_text(path: &str) -> Result<(String, Option<String>)> {
         // manifest: id -> (href, media-type)
         let mut manifest: std::collections::HashMap<String, (String, String)> =
             std::collections::HashMap::new();
-        for m in regex::Regex::new(r"(?is)<item\b[^>]*>").unwrap().find_iter(&opf) {
+        for m in regex::Regex::new(r"(?is)<item\b[^>]*>")
+            .unwrap()
+            .find_iter(&opf)
+        {
             let tag = m.as_str();
             if let (Some(id), Some(href)) = (attr(tag, "id"), attr(tag, "href")) {
                 manifest.insert(id, (href, attr(tag, "media-type").unwrap_or_default()));
@@ -540,7 +565,10 @@ pub fn epub_to_text(path: &str) -> Result<(String, Option<String>)> {
         }
         // spine: ordered idrefs → manifest hrefs (XHTML content documents only)
         let mut order = Vec::new();
-        for m in regex::Regex::new(r"(?is)<itemref\b[^>]*>").unwrap().find_iter(&opf) {
+        for m in regex::Regex::new(r"(?is)<itemref\b[^>]*>")
+            .unwrap()
+            .find_iter(&opf)
+        {
             if let Some(idref) = attr(m.as_str(), "idref") {
                 if let Some((href, mtype)) = manifest.get(&idref) {
                     if is_xhtml(href, mtype) {
@@ -577,7 +605,10 @@ pub fn epub_to_text(path: &str) -> Result<(String, Option<String>)> {
     }
     let out = out.trim().to_string();
     if out.is_empty() {
-        Ok((String::new(), Some("warning: no readable text found in EPUB".into())))
+        Ok((
+            String::new(),
+            Some("warning: no readable text found in EPUB".into()),
+        ))
     } else {
         Ok((out, None))
     }
@@ -688,7 +719,11 @@ fn youtube_to_text(url: &str) -> Result<(String, Option<String>)> {
         }
         Ok(o) => Err(Error::Other(format!(
             "yt-dlp failed: {}",
-            String::from_utf8_lossy(&o.stderr).trim().chars().take(200).collect::<String>()
+            String::from_utf8_lossy(&o.stderr)
+                .trim()
+                .chars()
+                .take(200)
+                .collect::<String>()
         ))),
         Err(e) => Err(Error::Other(format!("yt-dlp not runnable: {e}"))),
     };
@@ -716,8 +751,13 @@ fn youtube_via_http(url: &str) -> Result<(String, Option<String>)> {
     // Prefer an English track; otherwise take the first.
     let mut chosen: Option<String> = None;
     for chunk in tracks.split("},{") {
-        let Some(burl) = burl_re.captures(chunk).map(|c| c[1].to_string()) else { continue };
-        let lang = lang_re.captures(chunk).map(|c| c[1].to_string()).unwrap_or_default();
+        let Some(burl) = burl_re.captures(chunk).map(|c| c[1].to_string()) else {
+            continue;
+        };
+        let lang = lang_re
+            .captures(chunk)
+            .map(|c| c[1].to_string())
+            .unwrap_or_default();
         if lang.starts_with("en") {
             chosen = Some(burl);
             break;
@@ -1048,7 +1088,8 @@ mod tests {
         let docx = dir.join("doc.docx");
         {
             let mut zw = zip::ZipWriter::new(std::fs::File::create(&docx).unwrap());
-            zw.start_file("word/document.xml", SimpleFileOptions::default()).unwrap();
+            zw.start_file("word/document.xml", SimpleFileOptions::default())
+                .unwrap();
             zw.write_all(
                 br#"<?xml version="1.0"?><w:document><w:body>
                 <w:p><w:r><w:t>Hello</w:t></w:r><w:r><w:t xml:space="preserve"> world</w:t></w:r></w:p>
@@ -1066,14 +1107,27 @@ mod tests {
         {
             let mut zw = zip::ZipWriter::new(std::fs::File::create(&pptx).unwrap());
             for (n, body) in [(2u32, "Second"), (10u32, "Tenth")] {
-                zw.start_file(format!("ppt/slides/slide{n}.xml"), SimpleFileOptions::default()).unwrap();
-                zw.write_all(format!(r#"<p:sld><a:p><a:r><a:t>{body}</a:t></a:r></a:p></p:sld>"#).as_bytes()).unwrap();
+                zw.start_file(
+                    format!("ppt/slides/slide{n}.xml"),
+                    SimpleFileOptions::default(),
+                )
+                .unwrap();
+                zw.write_all(
+                    format!(r#"<p:sld><a:p><a:r><a:t>{body}</a:t></a:r></a:p></p:sld>"#).as_bytes(),
+                )
+                .unwrap();
             }
             zw.finish().unwrap();
         }
         let ptext = ooxml_to_text(pptx.to_str().unwrap()).unwrap();
-        assert!(ptext.contains("Second") && ptext.contains("Tenth"), "pptx text: {ptext:?}");
-        assert!(ptext.find("Second").unwrap() < ptext.find("Tenth").unwrap(), "slide order: {ptext:?}");
+        assert!(
+            ptext.contains("Second") && ptext.contains("Tenth"),
+            "pptx text: {ptext:?}"
+        );
+        assert!(
+            ptext.find("Second").unwrap() < ptext.find("Tenth").unwrap(),
+            "slide order: {ptext:?}"
+        );
 
         // A non-OOXML file (legacy binary) errors so the caller falls back to LibreOffice.
         let doc = dir.join("legacy.doc");
@@ -1112,11 +1166,16 @@ mod tests {
                 </manifest>
                 <spine><itemref idref="c1"/><itemref idref="c2"/></spine>
                 </package>"#,
-            ).unwrap();
+            )
+            .unwrap();
             zw.start_file("OEBPS/text/1.xhtml", opts).unwrap();
-            zw.write_all(br#"<html><body><h1>First chapter</h1><p>Cats &amp; dogs</p></body></html>"#).unwrap();
+            zw.write_all(
+                br#"<html><body><h1>First chapter</h1><p>Cats &amp; dogs</p></body></html>"#,
+            )
+            .unwrap();
             zw.start_file("OEBPS/text/2.xhtml", opts).unwrap();
-            zw.write_all(br#"<html><body><p>Second chapter</p></body></html>"#).unwrap();
+            zw.write_all(br#"<html><body><p>Second chapter</p></body></html>"#)
+                .unwrap();
             zw.finish().unwrap();
         }
 
@@ -1148,13 +1207,25 @@ mod tests {
     #[test]
     fn detect_kind_from_url_and_path() {
         let yt = AddSourceInput {
-            subject_id: "s".into(), topic_id: None, name: None, kind: None,
-            text: None, path: None, url: Some("https://youtu.be/x".into()), tags: vec![],
+            subject_id: "s".into(),
+            topic_id: None,
+            name: None,
+            kind: None,
+            text: None,
+            path: None,
+            url: Some("https://youtu.be/x".into()),
+            tags: vec![],
         };
         assert_eq!(detect_kind(&yt), "yt");
         let pdf = AddSourceInput {
-            subject_id: "s".into(), topic_id: None, name: None, kind: None,
-            text: None, path: Some("/tmp/lec.pdf".into()), url: None, tags: vec![],
+            subject_id: "s".into(),
+            topic_id: None,
+            name: None,
+            kind: None,
+            text: None,
+            path: Some("/tmp/lec.pdf".into()),
+            url: None,
+            tags: vec![],
         };
         assert_eq!(detect_kind(&pdf), "pdf");
     }

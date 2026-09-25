@@ -92,7 +92,10 @@ describe("Cortex UI localization", () => {
       ["Embedding", "嵌入模型"],
       ["Vector index for retrieval", "用于检索的向量索引"],
       ["n/a", "不适用"],
-      ["Ollama tasks run fully offline on this machine or your homelab — no key required.", "Ollama 任务可在本机或家庭服务器上完全离线运行，无需密钥。"],
+      ["Ollama and LM Studio can run tasks locally; choose either provider separately for each task.", "Ollama 和 LM Studio 都可在本地运行任务；每项任务都能单独选择服务商。"],
+      ["Local model services", "本地模型服务"],
+      ["Configure Ollama and LM Studio here, then choose either provider separately for each task in Models.", "在这里配置 Ollama 和 LM Studio，然后在“模型”中为每项任务单独选择服务商。"],
+      ["OpenAI-compatible local server. Authentication is optional.", "兼容 OpenAI 的本地服务；身份验证可选。"],
       ["Custom endpoint", "自定义接口"],
       ["Custom endpoint URL", "自定义接口地址"],
       ["OpenAI-compatible base URL", "兼容 OpenAI 的基础地址"],
@@ -201,6 +204,14 @@ describe("Cortex UI localization", () => {
       ["Try again", "重试"],
       ["Can't use the mic?", "无法使用麦克风？"],
       ["Upload an audio file", "上传音频文件"],
+      ["Recording input", "录音输入"],
+      ["Microphone", "麦克风"],
+      ["Microphone and system audio", "麦克风和系统声音"],
+      ["Always records your microphone. Enable system audio to also capture sound played by this Mac.", "始终录制麦克风。启用系统声音后，还会录制这台 Mac 播放的声音。"],
+      ["System audio capture requires macOS 15 or later and Screen Recording permission.", "系统声音录制需要 macOS 15 或更高版本，并授予屏幕录制权限。"],
+      ["Draft translation", "临时译文"],
+      ["Final translation", "最终译文"],
+      ["Final translation unavailable", "最终翻译不可用"],
     ];
 
     expectTranslations(cases);
@@ -269,6 +280,8 @@ describe("Cortex UI localization", () => {
       ["help", "帮助"],
       ["command", "命令"],
       ["lo-fi · ad-free study", "低保真音乐 · 无广告学习"],
+      ["Couldn’t reach LM Studio — type a model id", "无法连接 LM Studio — 可手动输入模型 ID"],
+      ["No models returned by LM Studio — type a model id", "LM Studio 未返回模型 — 可手动输入模型 ID"],
     ];
 
     expectTranslations(cases);

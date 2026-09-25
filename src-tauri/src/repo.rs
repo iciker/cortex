@@ -20,9 +20,11 @@ pub fn insert_subject(
     let id = new_id();
     let ts = now_ms();
     let pos: i64 = conn
-        .query_row("SELECT COALESCE(MAX(position),-1)+1 FROM subjects", [], |r| {
-            r.get(0)
-        })
+        .query_row(
+            "SELECT COALESCE(MAX(position),-1)+1 FROM subjects",
+            [],
+            |r| r.get(0),
+        )
         .unwrap_or(0);
     conn.execute(
         "INSERT INTO subjects (id, name, code, glyph, color, status, streak, position, created_at, updated_at)
@@ -133,14 +135,15 @@ const SUBJECT_COLS: &str =
 /// Batched: a fixed 5 queries regardless of subject/topic/source counts
 /// (previously 1 + per-subject topics + per-topic sources + per-source tags).
 pub fn list_subjects(conn: &Connection) -> Result<Vec<Subject>> {
-    let sql = format!("SELECT {SUBJECT_COLS} FROM subjects WHERE archived=0 ORDER BY position, created_at");
+    let sql = format!(
+        "SELECT {SUBJECT_COLS} FROM subjects WHERE archived=0 ORDER BY position, created_at"
+    );
     let mut stmt = conn.prepare(&sql)?;
     let rows = stmt.query_map([], map_subject)?;
     let mut subjects: Vec<Subject> = rows.collect::<rusqlite::Result<_>>()?;
 
     let mut counts: HashMap<String, i64> = HashMap::new();
-    let mut stmt =
-        conn.prepare("SELECT subject_id, count(*) FROM sources GROUP BY subject_id")?;
+    let mut stmt = conn.prepare("SELECT subject_id, count(*) FROM sources GROUP BY subject_id")?;
     let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))?;
     for row in rows {
         let (sid, n) = row?;
@@ -176,7 +179,10 @@ pub fn get_subject(conn: &Connection, id: &str) -> Result<Subject> {
 // compared case/punctuation-insensitively. Deterministic, no model calls.
 
 fn squash_alnum(s: &str) -> String {
-    s.chars().filter(|c| c.is_alphanumeric()).flat_map(|c| c.to_lowercase()).collect()
+    s.chars()
+        .filter(|c| c.is_alphanumeric())
+        .flat_map(|c| c.to_lowercase())
+        .collect()
 }
 
 /// Best subject id for an event title (None if nothing matches confidently).
@@ -190,7 +196,12 @@ pub fn match_event_subject(conn: &Connection, title: &str) -> Result<Option<Stri
             "SELECT id, name, IFNULL(code,''), IFNULL(calendar_aliases,'') FROM subjects WHERE archived=0",
         )?;
         let rows = st.query_map([], |r| {
-            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?, r.get::<_, String>(3)?))
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, String>(3)?,
+            ))
         })?;
         rows.filter_map(|x| x.ok()).collect()
     };
@@ -225,9 +236,8 @@ pub fn match_event_subject(conn: &Connection, title: &str) -> Result<Option<Stri
 /// number newly filed.
 pub fn retag_calendar_events(conn: &Connection) -> Result<usize> {
     let pending: Vec<(String, String)> = {
-        let mut st = conn.prepare(
-            "SELECT id, title FROM events WHERE subject_id IS NULL OR subject_id=''",
-        )?;
+        let mut st =
+            conn.prepare("SELECT id, title FROM events WHERE subject_id IS NULL OR subject_id=''")?;
         let rows = st.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
         rows.filter_map(|x| x.ok()).collect()
     };
@@ -572,7 +582,9 @@ pub fn attach_tags(conn: &Connection, source_id: &str, tags: &[String]) -> Resul
             continue;
         }
         let tag_id: String = match conn
-            .query_row("SELECT id FROM tags WHERE name=?1", params![tag], |r| r.get(0))
+            .query_row("SELECT id FROM tags WHERE name=?1", params![tag], |r| {
+                r.get(0)
+            })
             .optional()?
         {
             Some(id) => id,
@@ -741,9 +753,8 @@ pub fn insert_chunk(
 
 /// List a source's stored chunks (text + vector dim) — embedding proof for the UI.
 pub fn list_chunks(conn: &Connection, source_id: &str) -> Result<Vec<ChunkInfo>> {
-    let mut stmt = conn.prepare(
-        "SELECT ord, text, dim, loc FROM chunks WHERE source_id=?1 ORDER BY ord",
-    )?;
+    let mut stmt =
+        conn.prepare("SELECT ord, text, dim, loc FROM chunks WHERE source_id=?1 ORDER BY ord")?;
     let rows = stmt.query_map(params![source_id], |r| {
         Ok(ChunkInfo {
             ord: r.get(0)?,
@@ -856,7 +867,11 @@ fn search_chunks_scan(
             score,
         });
     }
-    hits.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+    hits.sort_by(|a, b| {
+        b.score
+            .partial_cmp(&a.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
     hits.truncate(k);
     Ok(hits)
 }
@@ -865,12 +880,12 @@ fn search_chunks_scan(
 /// drop very short tokens and a small stopword list. De-duplicated, capped.
 fn query_terms(query: &str) -> Vec<String> {
     const STOPWORDS: &[&str] = &[
-        "the", "and", "for", "are", "but", "not", "you", "all", "any", "can", "her", "was",
-        "one", "our", "out", "day", "get", "has", "him", "his", "how", "man", "new", "now",
-        "old", "see", "two", "way", "who", "boy", "did", "its", "let", "put", "say", "she",
-        "too", "use", "what", "when", "with", "this", "that", "from", "have", "your", "about",
-        "into", "than", "then", "them", "they", "will", "would", "could", "should", "does",
-        "doing", "explain", "describe", "tell", "give", "list", "define",
+        "the", "and", "for", "are", "but", "not", "you", "all", "any", "can", "her", "was", "one",
+        "our", "out", "day", "get", "has", "him", "his", "how", "man", "new", "now", "old", "see",
+        "two", "way", "who", "boy", "did", "its", "let", "put", "say", "she", "too", "use", "what",
+        "when", "with", "this", "that", "from", "have", "your", "about", "into", "than", "then",
+        "them", "they", "will", "would", "could", "should", "does", "doing", "explain", "describe",
+        "tell", "give", "list", "define",
     ];
     let mut seen = std::collections::HashSet::new();
     let mut terms = Vec::new();
@@ -938,7 +953,11 @@ pub fn keyword_search_chunks(
             score: matched as f32 / terms.len() as f32,
         });
     }
-    hits.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+    hits.sort_by(|a, b| {
+        b.score
+            .partial_cmp(&a.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
     hits.truncate(k);
     Ok(hits)
 }
@@ -975,9 +994,8 @@ pub fn context_text(
         where_sql.push(')');
     }
 
-    let text_sql = format!(
-        "SELECT c.source_id, c.text FROM chunks c{where_sql} ORDER BY c.source_id, c.ord"
-    );
+    let text_sql =
+        format!("SELECT c.source_id, c.text FROM chunks c{where_sql} ORDER BY c.source_id, c.ord");
     let mut stmt = conn.prepare(&text_sql)?;
     let rows = stmt.query_map(rusqlite::params_from_iter(binds.iter()), |r| {
         Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
@@ -1039,7 +1057,9 @@ pub fn context_text(
 
     let count_sql = format!("SELECT count(DISTINCT c.source_id) FROM chunks c{where_sql}");
     let src_count: i64 =
-        conn.query_row(&count_sql, rusqlite::params_from_iter(binds.iter()), |r| r.get(0))?;
+        conn.query_row(&count_sql, rusqlite::params_from_iter(binds.iter()), |r| {
+            r.get(0)
+        })?;
     Ok((out, src_count))
 }
 
@@ -1067,7 +1087,9 @@ pub fn bucket_source_ids(
         ),
     };
     let mut stmt = conn.prepare(&sql)?;
-    let rows = stmt.query_map(rusqlite::params_from_iter(ids.iter()), |r| r.get::<_, String>(0))?;
+    let rows = stmt.query_map(rusqlite::params_from_iter(ids.iter()), |r| {
+        r.get::<_, String>(0)
+    })?;
     let mut out = Vec::new();
     for r in rows {
         out.push(r?);
@@ -1084,21 +1106,22 @@ pub fn save_cheatsheet(
     topic_id: Option<&str>,
     sections: &[CsSection],
 ) -> Result<()> {
-    conn.execute(
+    let tx = conn.unchecked_transaction()?;
+    tx.execute(
         "DELETE FROM cheatsheets WHERE subject_id=?1 AND IFNULL(topic_id,'')=IFNULL(?2,'')",
         params![subject_id, topic_id],
     )?;
     let cid = new_id();
     let ts = now_ms();
-    conn.execute(
+    tx.execute(
         "INSERT INTO cheatsheets (id, subject_id, topic_id, created_at, updated_at)
          VALUES (?1, ?2, ?3, ?4, ?4)",
         params![cid, subject_id, topic_id, ts],
     )?;
     for (i, sec) in sections.iter().enumerate() {
-        conn.execute(
-            "INSERT INTO cheatsheet_sections (id, cheatsheet_id, title, state, ord, body, image)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        tx.execute(
+            "INSERT INTO cheatsheet_sections (id, cheatsheet_id, title, state, ord, body, image, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
             params![
                 new_id(),
                 cid,
@@ -1107,9 +1130,11 @@ pub fn save_cheatsheet(
                 i as i64,
                 serde_json::to_string(&sec.items)?,
                 sec.image,
+                ts,
             ],
         )?;
     }
+    tx.commit()?;
     Ok(())
 }
 
@@ -1126,7 +1151,9 @@ pub fn get_cheatsheet_sections(
             |r| r.get(0),
         )
         .optional()?;
-    let Some(cid) = cid else { return Ok(Vec::new()) };
+    let Some(cid) = cid else {
+        return Ok(Vec::new());
+    };
     let mut stmt = conn.prepare(
         "SELECT id, title, state, body, image FROM cheatsheet_sections WHERE cheatsheet_id=?1 ORDER BY ord",
     )?;
@@ -1258,8 +1285,8 @@ pub fn save_material(
 ) -> Result<String> {
     let id = new_id();
     conn.execute(
-        "INSERT INTO materials (id, subject_id, topic_id, kind, title, meta, status, payload, created_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'ready', ?7, ?8)",
+        "INSERT INTO materials (id, subject_id, topic_id, kind, title, meta, status, payload, created_at, updated_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'ready', ?7, ?8, ?8)",
         params![id, subject_id, topic_id, kind, title, meta, payload.to_string(), now_ms()],
     )?;
     Ok(id)
@@ -1272,8 +1299,8 @@ pub fn delete_material(conn: &Connection, id: &str) -> Result<()> {
 
 pub fn rename_material(conn: &Connection, id: &str, title: &str) -> Result<()> {
     let n = conn.execute(
-        "UPDATE materials SET title=?2 WHERE id=?1",
-        params![id, title],
+        "UPDATE materials SET title=?2, updated_at=?3 WHERE id=?1",
+        params![id, title, now_ms()],
     )?;
     if n == 0 {
         return Err(Error::NotFound(format!("material {id}")));
@@ -1347,8 +1374,7 @@ fn row_to_exam(r: &rusqlite::Row) -> rusqlite::Result<ExamRec> {
             .unwrap_or_default(),
         title: r.get(3)?,
         duration_min: r.get(4)?,
-        questions: serde_json::from_str(&r.get::<_, String>(5)?)
-            .unwrap_or(serde_json::Value::Null),
+        questions: serde_json::from_str(&r.get::<_, String>(5)?).unwrap_or(serde_json::Value::Null),
         answers: answers
             .and_then(|s| serde_json::from_str(&s).ok())
             .unwrap_or(serde_json::Value::Null),
@@ -1382,7 +1408,15 @@ pub fn insert_exam(
         "INSERT INTO exams (id, subject_id, topic_ids, title, duration_min, questions, \
          status, created_at, updated_at) \
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'ready', ?7, ?7)",
-        params![id, subject_id, topics_json, title, duration_min, questions.to_string(), ts],
+        params![
+            id,
+            subject_id,
+            topics_json,
+            title,
+            duration_min,
+            questions.to_string(),
+            ts
+        ],
     )?;
     Ok(id)
 }
@@ -1443,7 +1477,13 @@ pub fn finalize_exam(
     let n = conn.execute(
         "UPDATE exams SET answers=?2, results=?3, score=?4, status='graded', updated_at=?5 \
          WHERE id=?1",
-        params![id, answers.to_string(), results.to_string(), score, now_ms()],
+        params![
+            id,
+            answers.to_string(),
+            results.to_string(),
+            score,
+            now_ms()
+        ],
     )?;
     if n == 0 {
         return Err(Error::NotFound(format!("exam {id}")));
@@ -1526,12 +1566,7 @@ pub fn set_active_thread(conn: &Connection, subject_id: &str, thread_id: &str) -
 }
 
 /// Append a message to the subject's active thread and bump its updated_at.
-pub fn add_chat_message(
-    conn: &Connection,
-    subject_id: &str,
-    role: &str,
-    text: &str,
-) -> Result<()> {
+pub fn add_chat_message(conn: &Connection, subject_id: &str, role: &str, text: &str) -> Result<()> {
     let tid = current_thread(conn, subject_id)?;
     let ts = now_ms();
     conn.execute(
@@ -1622,9 +1657,7 @@ pub fn list_threads(conn: &Connection, subject_id: &str) -> Result<Vec<ThreadInf
 /// All settings as a JSON object (for the Settings page to hydrate).
 pub fn all_settings(conn: &Connection) -> Result<serde_json::Value> {
     let mut stmt = conn.prepare("SELECT key, value FROM settings")?;
-    let rows = stmt.query_map([], |r| {
-        Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
-    })?;
+    let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
     let mut map = serde_json::Map::new();
     for row in rows {
         let (k, v) = row?;
@@ -1633,12 +1666,13 @@ pub fn all_settings(conn: &Connection) -> Result<serde_json::Value> {
     Ok(serde_json::Value::Object(map))
 }
 
-
 pub fn get_setting(conn: &Connection, key: &str) -> Result<Option<String>> {
     Ok(conn
-        .query_row("SELECT value FROM settings WHERE key=?1", params![key], |r| {
-            r.get(0)
-        })
+        .query_row(
+            "SELECT value FROM settings WHERE key=?1",
+            params![key],
+            |r| r.get(0),
+        )
         .optional()?)
 }
 
@@ -1721,7 +1755,11 @@ pub fn insert_custom_station(
     let ts = now_ms();
     // Append to the end of the list.
     let pos: i64 = conn
-        .query_row("SELECT COALESCE(MAX(position) + 1, 0) FROM custom_stations", [], |r| r.get(0))
+        .query_row(
+            "SELECT COALESCE(MAX(position) + 1, 0) FROM custom_stations",
+            [],
+            |r| r.get(0),
+        )
         .unwrap_or(0);
     conn.execute(
         "INSERT INTO custom_stations (id, name, url, kind, position, created_at)
@@ -1775,24 +1813,23 @@ pub fn content_counts(conn: &Connection) -> (i64, i64, i64) {
 
 /// Delete all user content while keeping the settings table intact.
 pub fn delete_all_content(conn: &Connection) -> Result<()> {
-    // Order matters only loosely thanks to ON DELETE CASCADE, but be explicit.
-    for table in [
-        "chat_messages",
-        "chat_threads",
-        "cheatsheet_sections",
-        "cheatsheets",
-        "materials",
-        "chunks",
-        "source_tags",
-        "sources",
-        "topics",
-        "subjects",
-        "tags",
-        "user_memory",
-    ] {
-        // Ignore "no such table" so a partial schema never blocks the wipe.
-        let _ = conn.execute(&format!("DELETE FROM {table}"), []);
+    // Keep deletion markers so other devices cannot resurrect the wiped content.
+    let tables = {
+        let mut st = conn.prepare(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'
+             AND name NOT IN ('settings', 'tombstones')",
+        )?;
+        let rows = st.query_map([], |r| r.get::<_, String>(0))?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()?
+    };
+    let tx = conn.unchecked_transaction()?;
+    for table in tables {
+        tx.execute(
+            &format!("DELETE FROM \"{}\"", table.replace('"', "\"\"")),
+            [],
+        )?;
     }
+    tx.commit()?;
     Ok(())
 }
 
@@ -1811,8 +1848,7 @@ fn map_note(r: &rusqlite::Row) -> rusqlite::Result<Note> {
     })
 }
 
-const NOTE_COLS: &str =
-    "id, subject_id, topic_id, title, body, source_id, created_at, updated_at";
+const NOTE_COLS: &str = "id, subject_id, topic_id, title, body, source_id, created_at, updated_at";
 
 pub fn insert_note(
     conn: &Connection,
@@ -1877,8 +1913,16 @@ pub fn delete_note(conn: &Connection, id: &str) -> Result<()> {
 
 /// Tags are stored as a ';'-separated text list (tags shouldn't contain ';').
 pub fn tags_to_text(tags: &[String]) -> Option<String> {
-    let t: Vec<&str> = tags.iter().map(|s| s.trim()).filter(|s| !s.is_empty()).collect();
-    if t.is_empty() { None } else { Some(t.join(";")) }
+    let t: Vec<&str> = tags
+        .iter()
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .collect();
+    if t.is_empty() {
+        None
+    } else {
+        Some(t.join(";"))
+    }
 }
 fn text_to_tags(s: Option<String>) -> Vec<String> {
     s.map(|s| {
@@ -1891,7 +1935,8 @@ fn text_to_tags(s: Option<String>) -> Vec<String> {
 }
 /// The deadline checklist (done topic ids) is stored as a JSON array.
 fn text_to_ids(s: Option<String>) -> Vec<String> {
-    s.and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_default()
+    s.and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default()
 }
 
 fn map_event(r: &rusqlite::Row) -> rusqlite::Result<CalEvent> {
@@ -1917,7 +1962,11 @@ fn map_event(r: &rusqlite::Row) -> rusqlite::Result<CalEvent> {
         // status is NULL on rows from before the board existed — derive it from
         // the binary `done` flag so they appear in the right column.
         status: r.get::<_, Option<String>>(20)?.unwrap_or_else(|| {
-            if r.get::<_, i64>(10).unwrap_or(0) != 0 { "done".into() } else { "todo".into() }
+            if r.get::<_, i64>(10).unwrap_or(0) != 0 {
+                "done".into()
+            } else {
+                "todo".into()
+            }
         }),
         created_at: r.get(14)?,
         updated_at: r.get(15)?,
@@ -1954,9 +2003,21 @@ pub fn insert_event(
              priority, topic_ids)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 0, ?11, 0, ?12, ?12, ?13, ?14, ?15)",
         params![
-            id, subject_id, title, description, location, color, start_ms, end_ms,
-            all_day as i64, kind, reminder_ms, ts, tags_to_text(tags),
-            priority, tags_to_text(topic_ids)
+            id,
+            subject_id,
+            title,
+            description,
+            location,
+            color,
+            start_ms,
+            end_ms,
+            all_day as i64,
+            kind,
+            reminder_ms,
+            ts,
+            tags_to_text(tags),
+            priority,
+            tags_to_text(topic_ids)
         ],
     )?;
     Ok(id)
@@ -2012,9 +2073,20 @@ pub fn update_event(
             priority=?13, topic_ids=?14
          WHERE id=?1",
         params![
-            id, title, description, location, color, start_ms, end_ms,
-            all_day as i64, kind, reminder_ms, now_ms(), tags_to_text(tags),
-            priority, tags_to_text(topic_ids)
+            id,
+            title,
+            description,
+            location,
+            color,
+            start_ms,
+            end_ms,
+            all_day as i64,
+            kind,
+            reminder_ms,
+            now_ms(),
+            tags_to_text(tags),
+            priority,
+            tags_to_text(topic_ids)
         ],
     )?;
     if n == 0 {
@@ -2118,12 +2190,18 @@ pub fn upsert_event_by_google_id(
         Some(id) => {
             conn.execute(
                 "UPDATE events SET
-                    subject_id=?2, title=?3, description=?4, location=?5, color=?6,
-                    start_ms=?7, end_ms=?8, all_day=?9, kind=?10, reminder_ms=?11, updated_at=?12
+                    title=?2, description=?3, location=?4,
+                    start_ms=?5, end_ms=?6, all_day=?7, updated_at=?8
                  WHERE id=?1",
                 params![
-                    id, subject_id, title, description, location, color, start_ms, end_ms,
-                    all_day as i64, kind, reminder_ms, ts
+                    id,
+                    title,
+                    description,
+                    location,
+                    start_ms,
+                    end_ms,
+                    all_day as i64,
+                    ts
                 ],
             )?;
             Ok(id)
@@ -2149,8 +2227,19 @@ pub fn upsert_event_by_google_id(
                      all_day, kind, done, reminder_ms, notified, google_id, created_at, updated_at)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 0, ?11, 0, ?12, ?13, ?13)",
                 params![
-                    id, subject_id, title, description, location, color, start_ms, end_ms,
-                    all_day as i64, kind, reminder_ms, google_id, ts
+                    id,
+                    subject_id,
+                    title,
+                    description,
+                    location,
+                    color,
+                    start_ms,
+                    end_ms,
+                    all_day as i64,
+                    kind,
+                    reminder_ms,
+                    google_id,
+                    ts
                 ],
             )?;
             Ok(id)
@@ -2185,7 +2274,16 @@ pub fn record_attempt(
         "INSERT INTO attempts
             (id, subject_id, material_id, kind, item_index, item_key, correct, created_at)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-        params![id, subject_id, material_id, kind, item_index, item_key, correct as i64, now_ms()],
+        params![
+            id,
+            subject_id,
+            material_id,
+            kind,
+            item_index,
+            item_key,
+            correct as i64,
+            now_ms()
+        ],
     )?;
     Ok(id)
 }
@@ -2225,8 +2323,8 @@ pub fn wrong_items(conn: &Connection, subject_id: &str, kind: &str) -> Result<Ve
 // real retention. Default published parameters; same grading API as before.
 
 const FSRS_W: [f64; 17] = [
-    0.4872, 1.4003, 3.7145, 13.8206, 5.1618, 1.2298, 0.8975, 0.0310, 1.6474,
-    0.1367, 1.0461, 2.1072, 0.0793, 0.3246, 1.5870, 0.2272, 2.8755,
+    0.4872, 1.4003, 3.7145, 13.8206, 5.1618, 1.2298, 0.8975, 0.0310, 1.6474, 0.1367, 1.0461,
+    2.1072, 0.0793, 0.3246, 1.5870, 0.2272, 2.8755,
 ];
 const FSRS_DECAY: f64 = -0.5;
 const FSRS_FACTOR: f64 = 19.0 / 81.0;
@@ -2319,7 +2417,11 @@ pub fn srs_preview(
             let r = fsrs_retrievability(elapsed_d, s0);
             fsrs_next_stability(d0, s0, r, g)
         };
-        out[g - 1] = if g == 1 { 1 } else { fsrs_interval(s).min(cram_cap(g)) };
+        out[g - 1] = if g == 1 {
+            1
+        } else {
+            fsrs_interval(s).min(cram_cap(g))
+        };
     }
     Ok(out)
 }
@@ -2348,7 +2450,17 @@ pub fn srs_grade(
             "SELECT ease, interval_d, reps, lapses, stability, difficulty, updated_at
              FROM srs_cards WHERE subject_id=?1 AND kind=?2 AND item_key=?3",
             params![subject_id, kind, item_key],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?)),
+            |r| {
+                Ok((
+                    r.get(0)?,
+                    r.get(1)?,
+                    r.get(2)?,
+                    r.get(3)?,
+                    r.get(4)?,
+                    r.get(5)?,
+                    r.get(6)?,
+                ))
+            },
         )
         .optional()?;
     let is_new = existing.is_none();
@@ -2370,7 +2482,10 @@ pub fn srs_grade(
         let d0 = difficulty.unwrap_or((11.0 - 3.0 * ease).clamp(1.0, 10.0));
         let elapsed_d = ((now - last_seen) as f64 / 86_400_000.0).max(0.0);
         let r = fsrs_retrievability(elapsed_d, s0);
-        (fsrs_next_stability(d0, s0, r, g), fsrs_next_difficulty(d0, g))
+        (
+            fsrs_next_stability(d0, s0, r, g),
+            fsrs_next_difficulty(d0, g),
+        )
     };
 
     if g == 1 {
@@ -2400,15 +2515,41 @@ pub fn srs_grade(
             due_at=excluded.due_at, updated_at=excluded.updated_at,
             stability=excluded.stability, difficulty=excluded.difficulty",
         params![
-            new_id(), subject_id, material_id, kind, item_index, item_key,
-            ease, interval_d, reps, lapses, q, due_at, now, s, d
+            new_id(),
+            subject_id,
+            material_id,
+            kind,
+            item_index,
+            item_key,
+            ease,
+            interval_d,
+            reps,
+            lapses,
+            q,
+            due_at,
+            now,
+            s,
+            d
         ],
     )?;
 
     // Keep the legacy attempt log in sync (drives `wrong_items`).
-    record_attempt(conn, subject_id, material_id, kind, item_index, item_key, q >= 3)?;
+    record_attempt(
+        conn,
+        subject_id,
+        material_id,
+        kind,
+        item_index,
+        item_key,
+        q >= 3,
+    )?;
 
-    Ok(SrsResult { due_at, interval_d, reps, ease })
+    Ok(SrsResult {
+        due_at,
+        interval_d,
+        reps,
+        ease,
+    })
 }
 
 /// Cards whose `due_at` has arrived (<= now), oldest-due first — the study queue.
@@ -2513,7 +2654,18 @@ pub fn update_citation(
     let n = conn.execute(
         "UPDATE citations SET ctype=?2, title=?3, authors=?4, year=?5, container=?6,
             url=?7, doi=?8, notes=?9, updated_at=?10 WHERE id=?1",
-        params![id, ctype, title, authors, year, container, url, doi, notes, now_ms()],
+        params![
+            id,
+            ctype,
+            title,
+            authors,
+            year,
+            container,
+            url,
+            doi,
+            notes,
+            now_ms()
+        ],
     )?;
     if n == 0 {
         return Err(Error::NotFound(format!("citation {id}")));
@@ -2587,9 +2739,9 @@ pub fn analytics_summary(conn: &Connection, days: i64) -> Result<AnalyticsSummar
     let today_floor = day_floor_ms(now_ms());
     // Inclusive window start at local midnight, `days` days ago (so a 30-day
     // window covers today plus the previous 29 days).
-    let since_ms = today_floor - (days - 1) * DAY_MS;
+    let since_ms = local_day_offset(today_floor, -(days - 1));
     // The heatmap always spans a full rolling year (366 days, leap-safe).
-    let year_since_ms = today_floor - (YEAR_DAYS - 1) * DAY_MS;
+    let year_since_ms = local_day_offset(today_floor, -(YEAR_DAYS - 1));
 
     // ── per-day study minutes (work + passive app segments) ──
     // Minutes are summed from each segment's own duration so a partially-skipped
@@ -2604,7 +2756,8 @@ pub fn analytics_summary(conn: &Connection, days: i64) -> Result<AnalyticsSummar
          WHERE kind IN ('work','app') AND started_ms >= ?1
          GROUP BY d",
     )?;
-    let mut minutes_by_day: std::collections::HashMap<String, i64> = std::collections::HashMap::new();
+    let mut minutes_by_day: std::collections::HashMap<String, i64> =
+        std::collections::HashMap::new();
     for row in stmt.query_map(params![year_since_ms], |r| {
         Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?))
     })? {
@@ -2615,7 +2768,7 @@ pub fn analytics_summary(conn: &Connection, days: i64) -> Result<AnalyticsSummar
     // Full-year daily series for the contributions heatmap (oldest → newest).
     let mut year_minutes = Vec::with_capacity(YEAR_DAYS as usize);
     for i in 0..YEAR_DAYS {
-        let day = local_day_str(year_since_ms + i * DAY_MS);
+        let day = local_day_str(local_day_offset(year_since_ms, i));
         let minutes = *minutes_by_day.get(&day).unwrap_or(&0);
         year_minutes.push(DayMinutes { day, minutes });
     }
@@ -2632,7 +2785,11 @@ pub fn analytics_summary(conn: &Connection, days: i64) -> Result<AnalyticsSummar
     let mut reviews_by_day: std::collections::HashMap<String, (i64, i64)> =
         std::collections::HashMap::new();
     for row in stmt.query_map(params![since_ms], |r| {
-        Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?, r.get::<_, i64>(2)?))
+        Ok((
+            r.get::<_, String>(0)?,
+            r.get::<_, i64>(1)?,
+            r.get::<_, i64>(2)?,
+        ))
     })? {
         let (d, n, ok) = row?;
         reviews_by_day.insert(d, (n, ok));
@@ -2642,12 +2799,24 @@ pub fn analytics_summary(conn: &Connection, days: i64) -> Result<AnalyticsSummar
     let mut minutes_per_day = Vec::with_capacity(days as usize);
     let mut reviews_per_day = Vec::with_capacity(days as usize);
     for i in 0..days {
-        let day = local_day_str(since_ms + i * DAY_MS);
+        let day = local_day_str(local_day_offset(since_ms, i));
         let minutes = *minutes_by_day.get(&day).unwrap_or(&0);
-        minutes_per_day.push(DayMinutes { day: day.clone(), minutes });
+        minutes_per_day.push(DayMinutes {
+            day: day.clone(),
+            minutes,
+        });
         let (reviews, correct) = *reviews_by_day.get(&day).unwrap_or(&(0, 0));
-        let accuracy = if reviews > 0 { correct as f64 / reviews as f64 } else { 0.0 };
-        reviews_per_day.push(DayReviews { day, reviews, correct, accuracy });
+        let accuracy = if reviews > 0 {
+            correct as f64 / reviews as f64
+        } else {
+            0.0
+        };
+        reviews_per_day.push(DayReviews {
+            day,
+            reviews,
+            correct,
+            accuracy,
+        });
     }
 
     // ── current streak: consecutive days ending today with ANY activity ──
@@ -2657,15 +2826,18 @@ pub fn analytics_summary(conn: &Connection, days: i64) -> Result<AnalyticsSummar
     loop {
         let day = local_day_str(cursor);
         let had_work = *minutes_by_day.get(&day).unwrap_or(&0) > 0;
-        let had_review = reviews_by_day.get(&day).map(|(n, _)| *n > 0).unwrap_or(false);
+        let had_review = reviews_by_day
+            .get(&day)
+            .map(|(n, _)| *n > 0)
+            .unwrap_or(false);
         if had_work || had_review {
             streak += 1;
-            cursor -= DAY_MS;
+            cursor = local_day_offset(cursor, -1);
         } else {
             // Today with no activity yet doesn't break a streak earned yesterday:
             // skip today once, then require unbroken activity backward.
             if day == today {
-                cursor -= DAY_MS;
+                cursor = local_day_offset(cursor, -1);
                 continue;
             }
             break;
@@ -2709,7 +2881,11 @@ pub fn analytics_summary(conn: &Connection, days: i64) -> Result<AnalyticsSummar
          GROUP BY subject_id",
     )?;
     for row in stmt.query_map(params![since_ms], |r| {
-        Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?, r.get::<_, i64>(2)?))
+        Ok((
+            r.get::<_, String>(0)?,
+            r.get::<_, i64>(1)?,
+            r.get::<_, i64>(2)?,
+        ))
     })? {
         let (sid, n, ok) = row?;
         let e = subj.entry(sid.clone()).or_insert_with(|| SubjectStat {
@@ -2724,7 +2900,11 @@ pub fn analytics_summary(conn: &Connection, days: i64) -> Result<AnalyticsSummar
     }
     let mut per_subject: Vec<SubjectStat> = subj.into_values().collect();
     for s in per_subject.iter_mut() {
-        s.accuracy = if s.reviews > 0 { s.correct as f64 / s.reviews as f64 } else { 0.0 };
+        s.accuracy = if s.reviews > 0 {
+            s.correct as f64 / s.reviews as f64
+        } else {
+            0.0
+        };
     }
     // Most-studied first, then most-reviewed — stable, useful ordering for a table.
     per_subject.sort_by(|a, b| {
@@ -2742,7 +2922,7 @@ pub fn analytics_summary(conn: &Connection, days: i64) -> Result<AnalyticsSummar
          GROUP BY d",
     )?;
     let forecast_start = day_floor_ms(now_ms());
-    let forecast_end = forecast_start + 7 * DAY_MS;
+    let forecast_end = local_day_offset(forecast_start, 7);
     let mut due_by_day: std::collections::HashMap<String, i64> = std::collections::HashMap::new();
     for row in stmt.query_map(params![forecast_start, forecast_end], |r| {
         Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?))
@@ -2752,27 +2932,32 @@ pub fn analytics_summary(conn: &Connection, days: i64) -> Result<AnalyticsSummar
     }
     let mut due_forecast = Vec::with_capacity(7);
     for i in 0..7 {
-        let day = local_day_str(forecast_start + i * DAY_MS);
+        let day = local_day_str(local_day_offset(forecast_start, i));
         let due = *due_by_day.get(&day).unwrap_or(&0);
         due_forecast.push(DueDay { day, due });
     }
 
     // ── FSRS totals (all scheduled cards, not windowed) ──
     let cards: i64 = conn.query_row("SELECT COUNT(*) FROM srs_cards", [], |r| r.get(0))?;
-    let lapses: i64 = conn
-        .query_row("SELECT COALESCE(SUM(lapses), 0) FROM srs_cards", [], |r| r.get(0))?;
+    let lapses: i64 =
+        conn.query_row("SELECT COALESCE(SUM(lapses), 0) FROM srs_cards", [], |r| {
+            r.get(0)
+        })?;
     // Only average over cards that actually carry an FSRS stability (legacy SM-2
     // rows have NULL until first re-graded under FSRS).
-    let avg_stability: f64 = conn
-        .query_row(
-            "SELECT COALESCE(AVG(stability), 0.0) FROM srs_cards WHERE stability IS NOT NULL",
-            [],
-            |r| r.get(0),
-        )?;
-    let fsrs = FsrsTotals { cards, avg_stability, lapses };
+    let avg_stability: f64 = conn.query_row(
+        "SELECT COALESCE(AVG(stability), 0.0) FROM srs_cards WHERE stability IS NOT NULL",
+        [],
+        |r| r.get(0),
+    )?;
+    let fsrs = FsrsTotals {
+        cards,
+        avg_stability,
+        lapses,
+    };
 
     // ── rolling 7-day headline figures ──
-    let week_start = day_floor_ms(now_ms()) - 6 * DAY_MS;
+    let week_start = local_day_offset(now_ms(), -6);
     let minutes_week: i64 = conn.query_row(
         "SELECT COALESCE(SUM(ended_ms - started_ms), 0) / 60000
          FROM pomodoro_sessions WHERE kind IN ('work','app') AND started_ms >= ?1",
@@ -2812,7 +2997,11 @@ pub fn analytics_summary(conn: &Connection, days: i64) -> Result<AnalyticsSummar
 /// Per-topic stats for one subject (all its topics, oldest first). Attributes
 /// review attempts + FSRS cards via each material's topic — same attribution as
 /// `weak_topics`, but scoped to one subject and including topics with no activity.
-pub fn topic_stats(conn: &Connection, subject_id: &str, since_ms: i64) -> Result<Vec<crate::models::TopicStat>> {
+pub fn topic_stats(
+    conn: &Connection,
+    subject_id: &str,
+    since_ms: i64,
+) -> Result<Vec<crate::models::TopicStat>> {
     use crate::models::TopicStat;
     let mut topics: Vec<TopicStat> = {
         let mut st = conn.prepare(
@@ -2822,14 +3011,23 @@ pub fn topic_stats(conn: &Connection, subject_id: &str, since_ms: i64) -> Result
             Ok(TopicStat {
                 topic_id: r.get::<_, String>(0)?,
                 topic_name: r.get::<_, String>(1)?,
-                reviews: 0, correct: 0, accuracy: 0.0, lapses: 0, cards: 0, avg_stability: 0.0,
-                sources: 0, materials: 0,
+                reviews: 0,
+                correct: 0,
+                accuracy: 0.0,
+                lapses: 0,
+                cards: 0,
+                avg_stability: 0.0,
+                sources: 0,
+                materials: 0,
             })
         })?;
         rows.filter_map(|x| x.ok()).collect()
     };
-    let idx: std::collections::HashMap<String, usize> =
-        topics.iter().enumerate().map(|(i, t)| (t.topic_id.clone(), i)).collect();
+    let idx: std::collections::HashMap<String, usize> = topics
+        .iter()
+        .enumerate()
+        .map(|(i, t)| (t.topic_id.clone(), i))
+        .collect();
 
     // reviews + correct per topic (windowed)
     {
@@ -2840,13 +3038,21 @@ pub fn topic_stats(conn: &Connection, subject_id: &str, since_ms: i64) -> Result
              WHERE t.subject_id=?1 AND a.created_at>=?2 AND m.topic_id IS NOT NULL GROUP BY m.topic_id",
         )?;
         let rows = st.query_map(params![subject_id, since_ms], |r| {
-            Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?, r.get::<_, i64>(2)?))
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, i64>(1)?,
+                r.get::<_, i64>(2)?,
+            ))
         })?;
         for row in rows.flatten() {
             if let Some(&i) = idx.get(&row.0) {
                 topics[i].reviews = row.1;
                 topics[i].correct = row.2;
-                topics[i].accuracy = if row.1 > 0 { row.2 as f64 / row.1 as f64 } else { 0.0 };
+                topics[i].accuracy = if row.1 > 0 {
+                    row.2 as f64 / row.1 as f64
+                } else {
+                    0.0
+                };
             }
         }
     }
@@ -2859,7 +3065,13 @@ pub fn topic_stats(conn: &Connection, subject_id: &str, since_ms: i64) -> Result
              WHERE t.subject_id=?1 AND m.topic_id IS NOT NULL GROUP BY m.topic_id",
         )?;
         let rows = st.query_map(params![subject_id], |r| {
-            Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?, r.get::<_, i64>(2)?, r.get::<_, f64>(3)?, r.get::<_, i64>(4)?))
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, i64>(1)?,
+                r.get::<_, i64>(2)?,
+                r.get::<_, f64>(3)?,
+                r.get::<_, i64>(4)?,
+            ))
         })?;
         for row in rows.flatten() {
             if let Some(&i) = idx.get(&row.0) {
@@ -2870,7 +3082,8 @@ pub fn topic_stats(conn: &Connection, subject_id: &str, since_ms: i64) -> Result
         }
     }
     // sources + materials per topic (content invested — proxy for time on topic)
-    let counts: [(&str, fn(&mut crate::models::TopicStat, i64)); 2] = [
+    type SetTopicCount = fn(&mut crate::models::TopicStat, i64);
+    let counts: [(&str, SetTopicCount); 2] = [
         ("SELECT topic_id, COUNT(*) FROM sources WHERE subject_id=?1 AND topic_id IS NOT NULL GROUP BY topic_id",
             |t, n| t.sources = n),
         ("SELECT m.topic_id, COUNT(*) FROM materials m JOIN topics t ON t.id=m.topic_id WHERE t.subject_id=?1 AND m.topic_id IS NOT NULL GROUP BY m.topic_id",
@@ -2878,7 +3091,9 @@ pub fn topic_stats(conn: &Connection, subject_id: &str, since_ms: i64) -> Result
     ];
     for (sql, set) in counts {
         let mut st = conn.prepare(sql)?;
-        let rows = st.query_map(params![subject_id], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))?;
+        let rows = st.query_map(params![subject_id], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?))
+        })?;
         for row in rows.flatten() {
             if let Some(&i) = idx.get(&row.0) {
                 set(&mut topics[i], row.1);
@@ -2897,7 +3112,11 @@ fn pomodoro_stats(conn: &Connection, since_ms: i64) -> Result<crate::models::Pom
              WHERE started_ms >= ?1 AND kind IN ('work', 'break')",
         )?;
         let r = st.query_map(params![since_ms], |r| {
-            Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?, r.get::<_, i64>(2)?))
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, i64>(1)?,
+                r.get::<_, i64>(2)?,
+            ))
         })?;
         r.filter_map(|x| x.ok()).collect()
     };
@@ -3031,8 +3250,16 @@ fn weak_topics(conn: &Connection, since_ms: i64) -> Result<Vec<WeakTopic>> {
     let mut scored: Vec<(f64, WeakTopic)> = by_topic
         .into_iter()
         .map(|(topic_id, a)| {
-            let accuracy = if a.reviews > 0 { a.correct as f64 / a.reviews as f64 } else { 0.0 };
-            let avg_stability = if a.stab_n > 0 { a.stab_sum / a.stab_n as f64 } else { 0.0 };
+            let accuracy = if a.reviews > 0 {
+                a.correct as f64 / a.reviews as f64
+            } else {
+                0.0
+            };
+            let avg_stability = if a.stab_n > 0 {
+                a.stab_sum / a.stab_n as f64
+            } else {
+                0.0
+            };
 
             let inaccuracy = if a.reviews > 0 { 1.0 - accuracy } else { 0.0 };
             let lapse_load = a.lapses as f64 / (a.lapses as f64 + 3.0);
@@ -3050,12 +3277,20 @@ fn weak_topics(conn: &Connection, since_ms: i64) -> Result<Vec<WeakTopic>> {
                 bits.push(format!("{}% accuracy", (accuracy * 100.0).round() as i64));
             }
             if a.lapses > 0 {
-                bits.push(format!("{} lapse{}", a.lapses, if a.lapses == 1 { "" } else { "s" }));
+                bits.push(format!(
+                    "{} lapse{}",
+                    a.lapses,
+                    if a.lapses == 1 { "" } else { "s" }
+                ));
             }
             if a.stab_n > 0 && avg_stability < 7.0 {
                 bits.push("low retention".into());
             }
-            let reason = if bits.is_empty() { "Needs review".into() } else { bits.join(" · ") };
+            let reason = if bits.is_empty() {
+                "Needs review".into()
+            } else {
+                bits.join(" · ")
+            };
 
             (
                 score,
@@ -3097,19 +3332,24 @@ const YEAR_DAYS: i64 = 366;
 /// the GROUP BY date() buckets exactly (same TZ rules), avoiding off-by-one
 /// drift between Rust and SQLite timezone handling.
 fn day_floor_ms(ms: i64) -> i64 {
+    local_day_offset(ms, 0)
+}
+
+// Calendar-day steps preserve midnight across daylight-saving transitions.
+fn local_day_offset(ms: i64, days: i64) -> i64 {
     // Fallback to a crude UTC floor only if the (always-available) datetime
     // functions somehow fail; correctness here just affects bucket alignment.
     LOCAL_MIDNIGHT
         .with(|c| {
             let conn = c.borrow();
             conn.query_row(
-                "SELECT CAST(strftime('%s', date(?1/1000, 'unixepoch', 'localtime')) AS INTEGER) * 1000",
-                params![ms],
+                "SELECT CAST(strftime('%s', date(?1/1000, 'unixepoch', 'localtime', printf('%+d days', ?2)), 'utc') AS INTEGER) * 1000",
+                params![ms, days],
                 |r| r.get::<_, i64>(0),
             )
             .ok()
         })
-        .unwrap_or_else(|| ms - ms.rem_euclid(DAY_MS))
+        .unwrap_or_else(|| ms - ms.rem_euclid(DAY_MS) + days * DAY_MS)
 }
 
 /// Local-date string ("YYYY-MM-DD") for `ms` — matches the SQL date() buckets.
@@ -3151,40 +3391,137 @@ pub fn seed_showcase(conn: &Connection) -> Result<()> {
     // Tiny deterministic LCG so the showcase looks varied yet reproducible.
     let mut seed: u64 = 0x9E3779B97F4A7C15;
     let mut rnd = |n: u64| {
-        seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        seed = seed
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
         (seed >> 33) % n
     };
 
-    struct Subj { name: &'static str, code: &'static str, glyph: &'static str, color: &'static str,
-        topics: &'static [(&'static str, &'static [(&'static str, &'static str)])] }
+    struct Subj {
+        name: &'static str,
+        code: &'static str,
+        glyph: &'static str,
+        color: &'static str,
+        topics: &'static [(&'static str, &'static [(&'static str, &'static str)])],
+    }
     let subjects: &[Subj] = &[
-        Subj { name: "Cognitive Neuroscience", code: "NEU-301", glyph: "🧠", color: "#7c9cff", topics: &[
-            ("Neurons & Synapses", &[("lecture-02-action-potentials.pdf", "pdf"), ("synaptic-transmission.docx", "docx")]),
-            ("Memory Systems", &[("hippocampus-review.pdf", "pdf"), ("working-memory-notes.md", "md")]),
-            ("Visual Perception", &[("v1-pathways.pdf", "pdf"), ("attention-lecture.yt", "yt")]),
-        ]},
-        Subj { name: "Macroeconomics", code: "ECON-202", glyph: "📈", color: "#3ecf8e", topics: &[
-            ("Monetary Policy", &[("central-banking.pdf", "pdf"), ("inflation-targeting.web", "web")]),
-            ("Growth Models", &[("solow-model.pdf", "pdf"), ("endogenous-growth.md", "md")]),
-            ("Labour Markets", &[("unemployment-types.docx", "docx")]),
-        ]},
-        Subj { name: "Organic Chemistry", code: "CHEM-210", glyph: "⚗️", color: "#ff7a59", topics: &[
-            ("Reaction Mechanisms", &[("sn1-sn2.pdf", "pdf"), ("e1-e2-elimination.md", "md")]),
-            ("Stereochemistry", &[("chirality-lecture.pdf", "pdf")]),
-            ("Spectroscopy", &[("nmr-basics.pdf", "pdf"), ("ir-interpretation.web", "web")]),
-        ]},
-        Subj { name: "Modern World History", code: "HIST-150", glyph: "🏛️", color: "#d98cff", topics: &[
-            ("Industrial Revolution", &[("steam-and-society.pdf", "pdf"), ("factory-system.md", "md")]),
-            ("World Wars", &[("causes-of-wwi.pdf", "pdf"), ("interwar-period.docx", "docx")]),
-        ]},
-        Subj { name: "Linear Algebra", code: "MATH-204", glyph: "📐", color: "#ffc14d", topics: &[
-            ("Vector Spaces", &[("subspaces-basis.pdf", "pdf"), ("span-independence.md", "md")]),
-            ("Eigenvalues", &[("diagonalisation.pdf", "pdf")]),
-        ]},
-        Subj { name: "Software Architecture", code: "CS-340", glyph: "🖥️", color: "#5fd0ff", topics: &[
-            ("Design Patterns", &[("gof-patterns.pdf", "pdf"), ("solid-principles.md", "md")]),
-            ("Distributed Systems", &[("consensus-raft.pdf", "pdf"), ("cap-theorem.web", "web")]),
-        ]},
+        Subj {
+            name: "Cognitive Neuroscience",
+            code: "NEU-301",
+            glyph: "🧠",
+            color: "#7c9cff",
+            topics: &[
+                (
+                    "Neurons & Synapses",
+                    &[
+                        ("lecture-02-action-potentials.pdf", "pdf"),
+                        ("synaptic-transmission.docx", "docx"),
+                    ],
+                ),
+                (
+                    "Memory Systems",
+                    &[
+                        ("hippocampus-review.pdf", "pdf"),
+                        ("working-memory-notes.md", "md"),
+                    ],
+                ),
+                (
+                    "Visual Perception",
+                    &[("v1-pathways.pdf", "pdf"), ("attention-lecture.yt", "yt")],
+                ),
+            ],
+        },
+        Subj {
+            name: "Macroeconomics",
+            code: "ECON-202",
+            glyph: "📈",
+            color: "#3ecf8e",
+            topics: &[
+                (
+                    "Monetary Policy",
+                    &[
+                        ("central-banking.pdf", "pdf"),
+                        ("inflation-targeting.web", "web"),
+                    ],
+                ),
+                (
+                    "Growth Models",
+                    &[("solow-model.pdf", "pdf"), ("endogenous-growth.md", "md")],
+                ),
+                ("Labour Markets", &[("unemployment-types.docx", "docx")]),
+            ],
+        },
+        Subj {
+            name: "Organic Chemistry",
+            code: "CHEM-210",
+            glyph: "⚗️",
+            color: "#ff7a59",
+            topics: &[
+                (
+                    "Reaction Mechanisms",
+                    &[("sn1-sn2.pdf", "pdf"), ("e1-e2-elimination.md", "md")],
+                ),
+                ("Stereochemistry", &[("chirality-lecture.pdf", "pdf")]),
+                (
+                    "Spectroscopy",
+                    &[("nmr-basics.pdf", "pdf"), ("ir-interpretation.web", "web")],
+                ),
+            ],
+        },
+        Subj {
+            name: "Modern World History",
+            code: "HIST-150",
+            glyph: "🏛️",
+            color: "#d98cff",
+            topics: &[
+                (
+                    "Industrial Revolution",
+                    &[
+                        ("steam-and-society.pdf", "pdf"),
+                        ("factory-system.md", "md"),
+                    ],
+                ),
+                (
+                    "World Wars",
+                    &[
+                        ("causes-of-wwi.pdf", "pdf"),
+                        ("interwar-period.docx", "docx"),
+                    ],
+                ),
+            ],
+        },
+        Subj {
+            name: "Linear Algebra",
+            code: "MATH-204",
+            glyph: "📐",
+            color: "#ffc14d",
+            topics: &[
+                (
+                    "Vector Spaces",
+                    &[
+                        ("subspaces-basis.pdf", "pdf"),
+                        ("span-independence.md", "md"),
+                    ],
+                ),
+                ("Eigenvalues", &[("diagonalisation.pdf", "pdf")]),
+            ],
+        },
+        Subj {
+            name: "Software Architecture",
+            code: "CS-340",
+            glyph: "🖥️",
+            color: "#5fd0ff",
+            topics: &[
+                (
+                    "Design Patterns",
+                    &[("gof-patterns.pdf", "pdf"), ("solid-principles.md", "md")],
+                ),
+                (
+                    "Distributed Systems",
+                    &[("consensus-raft.pdf", "pdf"), ("cap-theorem.web", "web")],
+                ),
+            ],
+        },
     ];
 
     // Subjects → topics → sources.
@@ -3218,7 +3555,13 @@ pub fn seed_showcase(conn: &Connection) -> Result<()> {
             id: new_id(),
             title: title.into(),
             state: "ready".into(),
-            items: items.iter().map(|(t, d)| CsItem { t: (*t).into(), d: (*d).into() }).collect(),
+            items: items
+                .iter()
+                .map(|(t, d)| CsItem {
+                    t: (*t).into(),
+                    d: (*d).into(),
+                })
+                .collect(),
             image: None,
             image_query: None,
         }
@@ -3281,13 +3624,22 @@ pub fn seed_showcase(conn: &Connection) -> Result<()> {
     for (sid, topics) in subj_ids.iter().take(5) {
         let (tid, tname) = &topics[0];
         let deck: Vec<serde_json::Value> = (1..=8)
-            .map(|n| serde_json::json!({
-                "q": format!("{tname}: key question {n}?"),
-                "a": format!("A precise, exam-ready answer to question {n} about {tname}."),
-            }))
+            .map(|n| {
+                serde_json::json!({
+                    "q": format!("{tname}: key question {n}?"),
+                    "a": format!("A precise, exam-ready answer to question {n} about {tname}."),
+                })
+            })
             .collect();
-        save_material(conn, sid, Some(tid), "flashcards", &format!("{tname} flashcards"),
-            &format!("{} cards", deck.len()), &serde_json::Value::Array(deck))?;
+        save_material(
+            conn,
+            sid,
+            Some(tid),
+            "flashcards",
+            &format!("{tname} flashcards"),
+            &format!("{} cards", deck.len()),
+            &serde_json::Value::Array(deck),
+        )?;
 
         let quiz: Vec<serde_json::Value> = (1..=6)
             .map(|n| {
@@ -3300,8 +3652,15 @@ pub fn seed_showcase(conn: &Connection) -> Result<()> {
                 })
             })
             .collect();
-        save_material(conn, sid, Some(tid), "quiz", &format!("{tname} quiz"),
-            &format!("{} questions", quiz.len()), &serde_json::Value::Array(quiz))?;
+        save_material(
+            conn,
+            sid,
+            Some(tid),
+            "quiz",
+            &format!("{tname} quiz"),
+            &format!("{} questions", quiz.len()),
+            &serde_json::Value::Array(quiz),
+        )?;
     }
 
     // Assignments / deadlines / exams spread across the board columns + calendar.
@@ -3309,18 +3668,46 @@ pub fn seed_showcase(conn: &Connection) -> Result<()> {
     let prios = ["high", "med", "low"];
     let statuses = ["todo", "todo", "doing", "doing", "done"];
     let titles = [
-        "Problem Set", "Literature Review", "Midterm", "Lab Report", "Essay",
-        "Group Project", "Reading Response", "Final Exam", "Take-home Quiz", "Presentation",
+        "Problem Set",
+        "Literature Review",
+        "Midterm",
+        "Lab Report",
+        "Essay",
+        "Group Project",
+        "Reading Response",
+        "Final Exam",
+        "Take-home Quiz",
+        "Presentation",
     ];
     for (i, (sid, topics)) in subj_ids.iter().enumerate() {
         for j in 0..3 {
             let kind = kinds[(i + j) % kinds.len()];
-            let title = format!("{} {}", subjects[i].name.split(' ').next().unwrap_or(""), titles[(i * 3 + j) % titles.len()]);
+            let title = format!(
+                "{} {}",
+                subjects[i].name.split(' ').next().unwrap_or(""),
+                titles[(i * 3 + j) % titles.len()]
+            );
             let due = now + (rnd(40) as i64 - 10) * day; // -10 .. +30 days
-            let topic_ids: Vec<String> = topics.iter().take(1 + (j % 2)).map(|(t, _)| t.clone()).collect();
+            let topic_ids: Vec<String> = topics
+                .iter()
+                .take(1 + (j % 2))
+                .map(|(t, _)| t.clone())
+                .collect();
             let id = insert_event(
-                conn, Some(sid), &title, Some("Seeded demo assignment."), None, None,
-                due, None, true, kind, None, &[], Some(prios[(i + j) % prios.len()]), &topic_ids,
+                conn,
+                Some(sid),
+                &title,
+                Some("Seeded demo assignment."),
+                None,
+                None,
+                due,
+                None,
+                true,
+                kind,
+                None,
+                &[],
+                Some(prios[(i + j) % prios.len()]),
+                &topic_ids,
             )?;
             set_event_status(conn, &id, statuses[(i * 3 + j) % statuses.len()])?;
         }
@@ -3356,13 +3743,27 @@ pub fn seed_showcase(conn: &Connection) -> Result<()> {
 
     // A couple of notes and references for texture.
     if let Some((sid, topics)) = subj_ids.first() {
-        let _ = insert_note(conn, Some(sid), topics.first().map(|(t, _)| t.as_str()),
-            "Exam focus", "Prioritise mechanisms over memorising names. Revisit the worked examples.");
+        let _ = insert_note(
+            conn,
+            Some(sid),
+            topics.first().map(|(t, _)| t.as_str()),
+            "Exam focus",
+            "Prioritise mechanisms over memorising names. Revisit the worked examples.",
+        );
     }
     for (sid, _) in subj_ids.iter().take(3) {
-        let _ = insert_citation(conn, sid, "article", "Foundations of the Field",
-            Some("A. Researcher, B. Scholar"), Some("2021"), Some("Journal of Studies"),
-            Some("https://example.com/paper"), None, Some("Seminal overview."));
+        let _ = insert_citation(
+            conn,
+            sid,
+            "article",
+            "Foundations of the Field",
+            Some("A. Researcher, B. Scholar"),
+            Some("2021"),
+            Some("Journal of Studies"),
+            Some("https://example.com/paper"),
+            None,
+            Some("Seminal overview."),
+        );
     }
 
     Ok(())
@@ -3404,7 +3805,9 @@ mod tests {
         assert_eq!(live.len(), 1);
         assert_eq!(live[0].id, keep);
         assert!(!live[0].archived);
-        assert!(match_event_subject(&c, "Stored lecture 1").unwrap().is_none());
+        assert!(match_event_subject(&c, "Stored lecture 1")
+            .unwrap()
+            .is_none());
 
         // It still exists for the restore list, then comes back on unarchive.
         let archived = list_archived_subjects(&c).unwrap();
@@ -3434,10 +3837,20 @@ mod tests {
         // Growth-with-elapsed-time is asserted in fsrs_math_is_sane.
         let r2 = srs_grade(&c, &sid, None, "flashcard", 0, key, 4).unwrap();
         assert_eq!(r2.reps, 2);
-        assert!(r2.interval_d >= r1.interval_d, "{} < {}", r2.interval_d, r1.interval_d);
+        assert!(
+            r2.interval_d >= r1.interval_d,
+            "{} < {}",
+            r2.interval_d,
+            r1.interval_d
+        );
         let r3 = srs_grade(&c, &sid, None, "flashcard", 0, key, 5).unwrap();
         assert_eq!(r3.reps, 3);
-        assert!(r3.interval_d >= r2.interval_d, "{} < {}", r3.interval_d, r2.interval_d);
+        assert!(
+            r3.interval_d >= r2.interval_d,
+            "{} < {}",
+            r3.interval_d,
+            r2.interval_d
+        );
 
         // Exactly one schedule row (upsert, not insert-per-grade); 1 total card.
         assert_eq!(srs_stats(&c, &sid, "flashcard").unwrap().total, 1);
@@ -3479,8 +3892,16 @@ mod tests {
         let c = st.db.lock().unwrap();
         let sid = insert_subject(&c, "History", None, None, None).unwrap();
         let id = insert_citation(
-            &c, &sid, "book", "The Guns of August", Some("Tuchman, B."),
-            Some("1962"), Some("Macmillan"), None, None, Some("ch. 1"),
+            &c,
+            &sid,
+            "book",
+            "The Guns of August",
+            Some("Tuchman, B."),
+            Some("1962"),
+            Some("Macmillan"),
+            None,
+            None,
+            Some("ch. 1"),
         )
         .unwrap();
         let list = list_citations(&c, &sid).unwrap();
@@ -3489,8 +3910,16 @@ mod tests {
         assert_eq!(list[0].authors.as_deref(), Some("Tuchman, B."));
 
         update_citation(
-            &c, &id, "book", "The Guns of August (rev.)", Some("Tuchman, B."),
-            Some("1962"), Some("Macmillan"), Some("https://example.com"), None, None,
+            &c,
+            &id,
+            "book",
+            "The Guns of August (rev.)",
+            Some("Tuchman, B."),
+            Some("1962"),
+            Some("Macmillan"),
+            Some("https://example.com"),
+            None,
+            None,
         )
         .unwrap();
         let list = list_citations(&c, &sid).unwrap();
@@ -3507,7 +3936,10 @@ mod tests {
         let c = st.db.lock().unwrap();
         set_setting(&c, "embed_provider", "stub").unwrap();
         set_setting(&c, "embed_provider", "gemini").unwrap();
-        assert_eq!(get_setting(&c, "embed_provider").unwrap().unwrap(), "gemini");
+        assert_eq!(
+            get_setting(&c, "embed_provider").unwrap().unwrap(),
+            "gemini"
+        );
     }
 
     #[test]
@@ -3521,7 +3953,10 @@ mod tests {
         assert_eq!(get_note(&c, &id).unwrap().title, "Cells v2");
         let srcid = insert_source(&c, &sid, None, "Cells", "note", None).unwrap();
         set_note_source(&c, &id, &srcid).unwrap();
-        assert_eq!(get_note(&c, &id).unwrap().source_id.as_deref(), Some(srcid.as_str()));
+        assert_eq!(
+            get_note(&c, &id).unwrap().source_id.as_deref(),
+            Some(srcid.as_str())
+        );
         delete_note(&c, &id).unwrap();
         assert!(list_notes(&c, None).unwrap().is_empty());
     }
@@ -3531,11 +3966,37 @@ mod tests {
         let st = AppState::in_memory().unwrap();
         let c = st.db.lock().unwrap();
         let due = insert_event(
-            &c, None, "Exam", None, None, None, 1_000, Some(2_000), false, "event", Some(500), &[], None, &[],
+            &c,
+            None,
+            "Exam",
+            None,
+            None,
+            None,
+            1_000,
+            Some(2_000),
+            false,
+            "event",
+            Some(500),
+            &[],
+            None,
+            &[],
         )
         .unwrap();
         let _future = insert_event(
-            &c, None, "Later", None, None, None, 9_000, None, false, "task", Some(8_000), &[], None, &[],
+            &c,
+            None,
+            "Later",
+            None,
+            None,
+            None,
+            9_000,
+            None,
+            false,
+            "task",
+            Some(8_000),
+            &[],
+            None,
+            &[],
         )
         .unwrap();
         // only the past-due, un-notified reminder comes back at now=1000
@@ -3549,7 +4010,10 @@ mod tests {
         assert!(ev.done);
         // done flag and board status stay in lock-step.
         assert_eq!(ev.status, "done");
-        assert_eq!(list_events(&c, None, Some(0), Some(5_000)).unwrap().len(), 1);
+        assert_eq!(
+            list_events(&c, None, Some(0), Some(5_000)).unwrap().len(),
+            1
+        );
     }
 
     #[test]
@@ -3606,7 +4070,20 @@ mod tests {
         let st = AppState::in_memory().unwrap();
         let c = st.db.lock().unwrap();
         let id = insert_event(
-            &c, None, "Essay", None, None, None, 1_000, None, true, "assignment", None, &[], Some("high"), &[],
+            &c,
+            None,
+            "Essay",
+            None,
+            None,
+            None,
+            1_000,
+            None,
+            true,
+            "assignment",
+            None,
+            &[],
+            Some("high"),
+            &[],
         )
         .unwrap();
         // New row: NULL status derives to "todo" (done=0).
@@ -3681,7 +4158,11 @@ mod tests {
         let s = analytics_summary(&c, 30).unwrap();
         // 30-day window of contiguous days, today is the last bucket.
         assert_eq!(s.minutes_per_day.len(), 30);
-        assert_eq!(s.minutes_per_day.last().unwrap().minutes, 35, "work + app, no break");
+        assert_eq!(
+            s.minutes_per_day.last().unwrap().minutes,
+            35,
+            "work + app, no break"
+        );
         // The heatmap series always spans a full year, today last, same minutes.
         assert_eq!(s.year_minutes.len(), 366);
         assert_eq!(s.year_minutes.last().unwrap().minutes, 35, "today's bucket");
@@ -3749,7 +4230,10 @@ mod tests {
             id: title.to_lowercase().replace(' ', "-"),
             title: title.into(),
             state: "approved".into(),
-            items: vec![CsItem { t: term.into(), d: def.into() }],
+            items: vec![CsItem {
+                t: term.into(),
+                d: def.into(),
+            }],
             image: None,
             image_query: None,
         };
@@ -3770,8 +4254,7 @@ mod tests {
         let original_id = versions.last().unwrap().id.clone();
 
         // get_cheatsheet_version_full returns the right scope + payload.
-        let (got_sub, got_topic, got_secs) =
-            get_cheatsheet_version_full(&c, &original_id).unwrap();
+        let (got_sub, got_topic, got_secs) = get_cheatsheet_version_full(&c, &original_id).unwrap();
         assert_eq!(got_sub, sid);
         assert_eq!(got_topic, None);
         assert_eq!(got_secs[0].items[0].d, "growth rate");
@@ -3789,5 +4272,127 @@ mod tests {
         assert_eq!(after.len(), 4, "before-restore + restored snapshots added");
         assert_eq!(after[0].note, "restored");
         assert_eq!(after[1].note, "before restore");
+    }
+}
+
+#[cfg(test)]
+mod data_loss_regressions {
+    use super::*;
+    use crate::db::AppState;
+
+    #[test]
+    fn google_refresh_preserves_local_classification_and_reminder() {
+        let state = AppState::in_memory().unwrap();
+        let c = state.db.lock().unwrap();
+        let subject = insert_subject(&c, "Local course", None, None, None).unwrap();
+        let id = upsert_event_by_google_id(
+            &c,
+            "google-1",
+            Some(&subject),
+            "Lecture",
+            None,
+            None,
+            Some("red"),
+            1000,
+            None,
+            false,
+            "task",
+            Some(500),
+        )
+        .unwrap();
+        let refreshed = upsert_event_by_google_id(
+            &c,
+            "google-1",
+            None,
+            "Moved lecture",
+            Some("New details"),
+            Some("Room 2"),
+            None,
+            2000,
+            Some(3000),
+            false,
+            "event",
+            None,
+        )
+        .unwrap();
+        assert_eq!(refreshed, id);
+        let row: (String, String, String, i64, String, i64) = c.query_row(
+            "SELECT subject_id, color, kind, reminder_ms, title, start_ms FROM events WHERE id=?1", [&id],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?))).unwrap();
+        assert_eq!(
+            row,
+            (
+                subject,
+                "red".into(),
+                "task".into(),
+                500,
+                "Moved lecture".into(),
+                2000
+            )
+        );
+    }
+
+    #[test]
+    fn wipe_removes_detached_content_keeps_settings_and_rolls_back_on_error() {
+        let state = AppState::in_memory().unwrap();
+        let c = state.db.lock().unwrap();
+        seed_showcase(&c).unwrap();
+        set_setting(&c, "theme", "dark").unwrap();
+        c.execute_batch("INSERT INTO notes(id,title,body,created_at,updated_at) VALUES('wipe-note','private','private',1,1);
+            INSERT INTO moodle_courses(id,fullname,updated_at) VALUES('wipe-course','private',1);
+            INSERT INTO srs_cards(id,subject_id,kind,item_index,item_key,due_at,created_at,updated_at) VALUES('wipe-card','detached','quiz',0,'private',1,1,1);
+            CREATE TRIGGER reject_wipe BEFORE DELETE ON notes BEGIN SELECT RAISE(ABORT, 'test failure'); END;").unwrap();
+        assert!(delete_all_content(&c).is_err());
+        assert!(
+            count_table(&c, "subjects") > 0,
+            "failed wipe must roll back earlier deletes"
+        );
+        c.execute_batch("DROP TRIGGER reject_wipe").unwrap();
+        delete_all_content(&c).unwrap();
+        let mut st = c.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' AND name NOT IN ('settings','tombstones')").unwrap();
+        for table in st.query_map([], |r| r.get::<_, String>(0)).unwrap() {
+            let table = table.unwrap();
+            assert_eq!(count_table(&c, &table), 0, "{table}");
+        }
+        assert_eq!(get_setting(&c, "theme").unwrap().as_deref(), Some("dark"));
+        assert!(count_table(&c, "tombstones") > 0);
+    }
+}
+
+#[cfg(test)]
+mod calendar_regressions {
+    use super::*;
+
+    #[test]
+    fn local_midnight_and_day_steps_match_sql_calendar_across_dst() {
+        let c = Connection::open_in_memory().unwrap();
+        for date in ["2026-04-04", "2026-04-05", "2026-09-26", "2026-09-27"] {
+            let noon: i64 = c
+                .query_row(
+                    "SELECT unixepoch(?1 || ' 12:00:00', 'utc') * 1000",
+                    [date],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(local_day_str(day_floor_ms(noon)), date);
+            let time: String = c
+                .query_row(
+                    "SELECT time(?1/1000, 'unixepoch', 'localtime')",
+                    [day_floor_ms(noon)],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(time, "00:00:00");
+            for offset in [-1, 1] {
+                let expected: String = c
+                    .query_row(
+                        "SELECT date(?1, printf('%+d days', ?2))",
+                        params![date, offset],
+                        |r| r.get(0),
+                    )
+                    .unwrap();
+                assert_eq!(local_day_str(local_day_offset(noon, offset)), expected);
+            }
+        }
     }
 }

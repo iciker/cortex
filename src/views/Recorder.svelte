@@ -1,9 +1,20 @@
 <script lang="ts">
+  import { onMount, tick as domTick } from "svelte";
   import { app } from "../lib/store.svelte";
-  import { rec, liveTranscriptSupported } from "../lib/recorder.svelte";
+  import { rec } from "../lib/recorder.svelte";
   import Icon from "../components/Icon.svelte";
   import Picker from "../components/Picker.svelte";
   import { isMobile } from "../lib/platform";
+  import * as api from "../lib/api";
+  import { normalizeLiveAsrProvider, realtimeAsrDisplayName } from "../lib/realtime-asr";
+  import { newestFirstCaptions } from "../lib/live-captions";
+  onMount(() => {
+    if (!rec.recording && !rec.finishing) {
+      void api.getSetting("live_asr_provider").then((provider) => {
+        if (!rec.recording) rec.liveAsrProvider = normalizeLiveAsrProvider(provider);
+      });
+    }
+  });
 
   // ─────────────────────────────────────────────────────────────────────────
   // The capture engine lives in src/lib/recorder.svelte.ts (global) so a
@@ -19,21 +30,31 @@
   // Save-screen pickers: any subject in the library, and the CHOSEN subject's
   // topics (not just the active one — a lecture can be filed anywhere).
   const subjectOptions = $derived(
-    app.subjects.map((s) => ({ id: s.id, label: s.code ? `${s.name} · ${s.code}` : s.name })),
+    app.subjects.map((s) => ({
+      id: s.id,
+      label: s.code ? `${s.name} · ${s.code}` : s.name,
+      userContent: true,
+    })),
   );
   const topicOptions = $derived([
     { id: "", label: "— no topic —" },
-    ...(app.subjects.find((s) => s.id === rec.reviewSubjectId)?.topics ?? []).map((t) => ({ id: t.id, label: t.name })),
+    ...(app.subjects.find((s) => s.id === rec.reviewSubjectId)?.topics ?? []).map((t) => ({
+      id: t.id,
+      label: t.name,
+      userContent: true,
+    })),
   ]);
 
-  // ---- transcript auto-scroll (anchored to newest text unless the user scrolls up) ----
+  const newestCaptions = $derived(newestFirstCaptions(rec.captions));
+
+  // ---- transcript auto-scroll (newest item is at the top) ----
   let rtBody: HTMLDivElement | null = $state(null);
-  let rtPinned = $state(true); // stay glued to the bottom while true
+  let rtPinned = $state(true);
   function onRtScroll() {
     const el = rtBody;
     if (!el) return;
-    // Re-pin once the user returns to within a hair of the bottom.
-    rtPinned = el.scrollHeight - el.scrollTop - el.clientHeight < 24;
+    // Follow new captions until the user scrolls down to read history.
+    rtPinned = el.scrollTop < 24;
   }
 
   // ---- subtle animated waveform (Web Audio analyser on desktop, native level
@@ -113,12 +134,12 @@
     return () => cancelAnimationFrame(rafId);
   });
 
-  // ---- auto-scroll the transcript to the newest text (unless the user scrolled up) ----
+  // ---- keep the newest caption visible unless the user is reading history ----
   $effect(() => {
     // Touch the streams so this re-runs whenever new text lands.
-    void rec.liveFinal; void rec.liveInterim; void rec.liveBackendText;
+    void rec.captions; void rec.liveBackendText;
     const el = rtBody;
-    if (el && rtPinned) el.scrollTop = el.scrollHeight;
+    if (el && rtPinned) void domTick().then(() => { if (rtPinned) el.scrollTop = 0; });
   });
 
   // Leave the recorder view. The recording (if any) KEEPS RUNNING as a
@@ -131,6 +152,30 @@
   function discard() {
     rec.discardRecording();
     app.setView("subject");
+  }
+
+  async function openMicrophoneSettings() {
+    try {
+      await api.openMicrophoneSettings();
+    } catch (err) {
+      app.pushToast({
+        kind: "error",
+        title: "Couldn't open microphone settings",
+        body: String(err),
+      });
+    }
+  }
+
+  async function openSystemAudioSettings() {
+    try {
+      await api.openSystemAudioSettings();
+    } catch (err) {
+      app.pushToast({
+        kind: "error",
+        title: "Couldn't open system audio settings",
+        body: String(err),
+      });
+    }
   }
 
   // Fallback: pick a pre-recorded audio file and run it through the same pipeline.
@@ -252,11 +297,18 @@
 
         {#if rec.reviewTranscript.trim()}
           <div class="field" style:margin-top="14px">
-            <span class="onb-label mono">TRANSCRIPT PREVIEW <span class="faint">re-transcribed precisely on save</span></span>
-            <div class="rev-transcript read">{rec.reviewTranscript}</div>
+            <span class="onb-label mono">TRANSCRIPT PREVIEW <span class="faint">saved directly; use re-transcribe for Whisper refinement</span></span>
+            <div class="rev-transcript read" data-i18n-skip>{rec.reviewTranscript}</div>
           </div>
         {/if}
 
+        {#if rec.captions.length > 0}
+          <button class="btn btn--ghost btn--sm" onclick={() => rec.exportCaptions()}>Copy bilingual captions</button>
+          <div class="rev-transcript read" data-i18n-skip>{rec.captions.map((item) => item.translated || item.original).join("\n\n")}</div>
+        {/if}
+        {#if rec.captionError}
+          <div class="rev-error"><span>Live captions unavailable</span><div data-i18n-skip>{rec.captionError}</div></div>
+        {/if}
         {#if rec.errorMsg}
           <div class="rev-error">{rec.errorMsg}</div>
         {/if}
@@ -292,7 +344,7 @@
     </div>
 
     <div class="rec-controls">
-      {#if rec.status === "transcribing"}
+      {#if rec.finishing || rec.status === "transcribing"}
         <span class="is-spin" style:width="22px" style:height="22px"></span>
       {:else if !rec.recording}
         <button class="rec-btn rec-btn--go" onclick={() => rec.start()} title="Start recording">
@@ -308,7 +360,9 @@
     </div>
 
     <div class="rec-hint mono faint">
-      {#if rec.status === "transcribing"}
+      {#if rec.finishing}
+        Finishing captions…
+      {:else if rec.status === "transcribing"}
         Transcribing with Whisper…
       {:else if !rec.recording}
         Press <span class="kbd">␣</span> or click to start · output becomes a transcribed source
@@ -318,7 +372,18 @@
     </div>
 
     {#if rec.errorMsg}
-      <div style:color="var(--err)" style:margin-top="14px" style:font-size="var(--t-sm)" style:max-width="420px" style:text-align="center">{rec.errorMsg}</div>
+      <div class="rec-error-panel">
+        <div>{rec.errorMsg}</div>
+        <div class="rec-error-actions">
+          {#if rec.canOpenMicrophoneSettings}
+            <button class="btn btn--ghost btn--sm" onclick={openMicrophoneSettings}>Open microphone settings</button>
+          {/if}
+          {#if rec.canOpenSystemAudioSettings}
+            <button class="btn btn--ghost btn--sm" onclick={openSystemAudioSettings}>Open system audio settings</button>
+          {/if}
+          <button class="btn btn--ghost btn--sm" onclick={() => rec.start()}>Try again</button>
+        </div>
+      </div>
     {/if}
 
     <!-- Fallback: upload a pre-recorded audio file (always available, emphasised on error) -->
@@ -358,7 +423,7 @@
   {#if !isMobile}
   <aside class="rec-transcript">
     <div class="rt-head">
-      <span class="rt-eyebrow mono">LIVE TRANSCRIPT</span>
+      <span class="rt-eyebrow mono">Live translation</span>
       <span class="grow"></span>
       {#if rec.status === "transcribing"}
         <span class="status-pill status-pill--draft"><span class="dot dot--pulse"></span>processing</span>
@@ -373,47 +438,48 @@
       </button>
       <span class="kbd rt-kbd" title="Press t to toggle">t</span>
     </div>
+    <div class="rt-options">
+      <label for="caption-language">Translate to</label>
+      <select id="caption-language" class="input" bind:value={rec.translationTarget} disabled={rec.recording || rec.finishing}>
+        <option value="zh-CN">中文</option>
+        <option value="en" data-i18n-skip>English</option>
+      </select>
+      <button class="btn btn--ghost btn--sm" disabled={!rec.captions.length} onclick={() => rec.exportCaptions()}>Copy bilingual captions</button>
+    </div>
+    <p class="rt-help"><span>Live speech recognition</span>: <span data-i18n-skip>{realtimeAsrDisplayName(rec.liveAsrProvider)}</span> · <span>Draft and final translation models are selected in Settings.</span></p>
     <div class="rt-body" bind:this={rtBody} onscroll={onRtScroll}>
-      {#if rec.status === "transcribing"}
-        <div class="rt-empty mono faint">{rec.note || "Running Whisper on your recording…"}</div>
-        {#if rec.liveFinal.trim()}
-          <p class="rt-live read rt-live--dim">{rec.liveFinal}</p>
-        {:else if rec.liveBackendText.trim()}
-          <p class="rt-live read rt-live--dim">{rec.liveBackendText}</p>
-        {/if}
-      {:else if rec.recording && liveTranscriptSupported}
-        <!-- Real-time path: browser SpeechRecognition (final + interim). -->
-        {#if rec.hasLiveTranscript}
-          <p class="rt-live read">
-            {rec.liveFinal}<span class="rt-interim">{rec.liveInterim}</span>
-          </p>
-        {:else}
-          <div class="rt-listening mono faint"><span class="rt-shimmer">Listening</span><span class="rt-ell"></span></div>
-        {/if}
-      {:else if rec.recording && rec.whisperMissing}
-        <!-- Backend fallback tried, came back empty: no Whisper installed. Be honest. -->
-        <div class="rt-note rt-note--warn mono">
-          <span class="rt-note-title">Live transcript needs Whisper</span>
-          No Whisper backend answered. Configure a homelab Whisper server in Settings, or install
-          faster-whisper locally — the recording is still saved and transcribed when you stop.
-        </div>
-      {:else if rec.recording}
-        <!-- Backend chunked fallback (WebKitGTK / Tauri Linux): refreshes every ~7s. -->
-        {#if rec.liveBackendText.trim()}
-          <p class="rt-live read">{rec.liveBackendText}</p>
-        {:else}
-          <div class="rt-listening mono faint"><span class="rt-shimmer">Listening</span><span class="rt-ell"></span></div>
-        {/if}
-      {:else}
-        <div class="rt-empty mono faint">
-          Hit record to capture a lecture. On stop, Cortex transcribes it with Whisper and saves it as a searchable source.
-          A live transcript appears here while you record — close it with <span class="kbd">t</span>; closed means transcription is off until you reopen it.
-          Leaving this screen mid-recording keeps capturing — a small floating widget follows you around the app.
-        </div>
+      {#each newestCaptions as caption (caption.id)}
+        <article class="rt-caption">
+          <time class="mono faint">{Math.floor(caption.at / 60).toString().padStart(2, "0")}:{Math.floor(caption.at % 60).toString().padStart(2, "0")}</time>
+          {#if caption.speaker}<span class="mono faint"> · <span>Speaker</span> <span data-i18n-skip>{caption.speaker.replace(/^Speaker\s+/, "")}</span></span>{/if}
+          <p class="rt-live rt-original" data-i18n-skip>{caption.original}</p>
+          {#if caption.translated}
+            <span class:final={caption.translationFinal} class="rt-translation-state mono">
+              {caption.translationFinal ? "Final translation" : "Draft translation"}
+            </span>
+            <p class:rt-provisional={!caption.translationFinal} class="rt-live" data-i18n-skip>{caption.translated}</p>
+            {#if caption.error && caption.translated}
+              <p class="rt-caption-error"><span>Final translation unavailable</span><br /><span data-i18n-skip>{caption.error}</span></p>
+            {/if}
+          {:else if caption.error}
+            <p class="rt-caption-error"><span>Translation unavailable</span><br /><span data-i18n-skip>{caption.error}</span></p>
+          {:else}
+            <p class="mono faint">Translating…</p>
+          {/if}
+        </article>
+      {/each}
+      {#if rec.captionError}
+        <div class="rt-note rt-note--warn"><span>Live captions unavailable</span><p data-i18n-skip>{rec.captionError}</p></div>
+      {:else if rec.finishing}
+        <p class="mono faint">Finishing captions…</p>
+      {:else if rec.recording && !rec.captions.length}
+        <div class="rt-listening mono faint"><span class="rt-shimmer">Listening</span><span class="rt-ell"></span></div>
+      {:else if !rec.recording && !rec.captions.length}
+        <p class="rt-empty mono faint">Choose a translation language, then start recording. Original speech and translation appear here together. Audio inputs are configured in Settings → Audio.</p>
       {/if}
     </div>
     {#if rec.recording}
-      <button class="btn btn--ghost btn--sm rt-close" onclick={discard}>Discard recording</button>
+      <button class="btn btn--ghost btn--sm rt-close" disabled={rec.finishing} onclick={discard}>Discard recording</button>
     {:else}
       <button class="btn btn--ghost btn--sm rt-close" onclick={leave}>Close</button>
     {/if}
@@ -430,6 +496,44 @@
 {/if}
 
 <style>
+  .rt-options { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; padding: 12px 16px; }
+  .rt-options select { width: auto; }
+  .rt-help { margin: 0; padding: 0 16px 12px; color: var(--fg-muted); font-size: var(--t-xs); line-height: 1.5; }
+  .rt-caption { padding: 12px 0; border-bottom: 1px solid var(--border); }
+  .rt-caption time { font-size: var(--t-xs); }
+  .rt-caption .rt-original { color: var(--fg-muted); margin: 5px 0; }
+  .rt-provisional { opacity: .68; }
+  .rt-caption-error { color: var(--err); overflow-wrap: anywhere; }
+  .rt-translation-state {
+    display: inline-flex;
+    margin: 1px 0 4px;
+    padding: 2px 6px;
+    border: 1px solid color-mix(in oklab, var(--warn) 50%, var(--border));
+    border-radius: var(--rad-1);
+    color: var(--warn);
+    font-size: var(--t-2xs);
+    letter-spacing: .06em;
+    text-transform: uppercase;
+  }
+  .rt-translation-state.final {
+    border-color: color-mix(in oklab, var(--accent) 50%, var(--border));
+    color: var(--accent);
+  }
+
+  .rec-error-panel {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 10px;
+    max-width: 520px;
+    margin-top: 14px;
+    color: var(--err);
+    font-size: var(--t-sm);
+    line-height: 1.6;
+    text-align: center;
+  }
+  .rec-error-actions { display: flex; flex-wrap: wrap; justify-content: center; gap: 8px; }
+
   /* ---- compact, secondary waveform (the small mm:ss in .rec-status is the timer) ---- */
   .waveform--compact { height: 64px; max-width: 460px; opacity: 0.9; }
 

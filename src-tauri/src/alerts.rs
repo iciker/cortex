@@ -86,20 +86,6 @@ pub fn notify_routed(app: &AppHandle, key: &str, title: &str, body: &str, route:
         .show();
 }
 
-#[cfg(test)]
-mod tests {
-    use super::notif_id;
-
-    #[test]
-    fn notif_ids_are_stable_positive_and_distinct() {
-        assert_eq!(notif_id("moodle:assign:1:d"), notif_id("moodle:assign:1:d"));
-        assert!(notif_id("moodle:assign:1:d") > 0);
-        assert!(notif_id("src:abc") > 0);
-        assert_ne!(notif_id("moodle:assign:1:d"), notif_id("moodle:assign:1:h"));
-        assert_ne!(notif_id("src:abc"), notif_id("ev:abc"));
-    }
-}
-
 /// (Re)schedule local alerts for upcoming Moodle deadlines/exams: one the day
 /// before and one an hour before each due date, capped to the nearest 30
 /// deadlines in the next 14 days (iOS allows 64 pending). Called after every
@@ -159,10 +145,15 @@ pub fn schedule_deadline_alerts(app: &AppHandle) {
 
         for (did, name, due_ms, kind, course, subject_id) in rows {
             let exam = kind == "exam";
-            let course_bit = if course.is_empty() { String::new() } else { format!(" · {course}") };
-            for (slot, lead_ms, when) in
-                [("d", 86_400_000_i64, "tomorrow"), ("h", 3_600_000_i64, "in 1 hour")]
-            {
+            let course_bit = if course.is_empty() {
+                String::new()
+            } else {
+                format!(" · {course}")
+            };
+            for (slot, lead_ms, when) in [
+                ("d", 86_400_000_i64, "tomorrow"),
+                ("h", 3_600_000_i64, "in 1 hour"),
+            ] {
                 let at_ms = due_ms - lead_ms;
                 if at_ms <= now {
                     continue;
@@ -189,7 +180,10 @@ pub fn schedule_deadline_alerts(app: &AppHandle) {
                     .builder()
                     .id(id)
                     .title(title)
-                    .body(format!("{}{course_bit}", if exam { "Exam" } else { "Assignment" }))
+                    .body(format!(
+                        "{}{course_bit}",
+                        if exam { "Exam" } else { "Assignment" }
+                    ))
                     .schedule(Schedule::At {
                         date,
                         repeating: false,
@@ -198,5 +192,19 @@ pub fn schedule_deadline_alerts(app: &AppHandle) {
                     .show();
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::notif_id;
+
+    #[test]
+    fn notif_ids_are_stable_positive_and_distinct() {
+        assert_eq!(notif_id("moodle:assign:1:d"), notif_id("moodle:assign:1:d"));
+        assert!(notif_id("moodle:assign:1:d") > 0);
+        assert!(notif_id("src:abc") > 0);
+        assert_ne!(notif_id("moodle:assign:1:d"), notif_id("moodle:assign:1:h"));
+        assert_ne!(notif_id("src:abc"), notif_id("ev:abc"));
     }
 }

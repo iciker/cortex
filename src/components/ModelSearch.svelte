@@ -17,6 +17,7 @@
     loading = false,
     onOpen,
     allowCustom = false,
+    emptyText,
   }: {
     value: string;
     onChange: (id: string) => void;
@@ -26,6 +27,7 @@
     loading?: boolean;
     onOpen?: () => void;
     allowCustom?: boolean;
+    emptyText?: string;
   } = $props();
 
   const CAP = 60; // render at most this many rows; keep typing to narrow
@@ -130,7 +132,9 @@
       <div class="ms-list">
         {#if loading && options.length === 0}
           <div class="ms-empty">Loading models…</div>
-        {:else if shown.length === 0}
+        {:else if !q.trim() && emptyText && options.length === 0}
+          <div class="ms-empty">{emptyText}</div>
+        {:else if shown.length === 0 && !customCandidate}
           <div class="ms-empty">No models match “{q}”</div>
         {:else}
           {#if customCandidate}

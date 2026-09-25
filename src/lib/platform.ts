@@ -14,6 +14,15 @@ function ua(): string {
   return typeof navigator !== "undefined" ? navigator.userAgent : "";
 }
 
+function navigatorPlatform(): string {
+  return typeof navigator !== "undefined" ? navigator.platform : "";
+}
+
+export function detectMacOS(userAgent: string, platform: string): boolean {
+  if (/iPad|iPhone|iPod/i.test(userAgent)) return false;
+  return /Macintosh|Mac OS X/i.test(userAgent) || /^Mac/i.test(platform);
+}
+
 function forcedMobile(): boolean {
   if (typeof window === "undefined") return false;
   try {
@@ -26,6 +35,9 @@ function forcedMobile(): boolean {
 
 export const isIOS = /iPad|iPhone|iPod/i.test(ua());
 export const isAndroid = /Android/i.test(ua());
+// Tauri's WKWebView can expose a minimal user agent, while navigator.platform
+// still reports MacIntel. Check both so macOS-only controls render in the app.
+export const isMacOS = detectMacOS(ua(), navigatorPlatform());
 /** True on a phone/tablet build (or when the dev force-flag is set). */
 export const isMobile = forcedMobile() || isIOS || isAndroid;
 

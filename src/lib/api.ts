@@ -413,35 +413,61 @@ export const listExams = (subjectId: string) =>
 export const getExam = (id: string) => invoke<ExamRec>("get_exam", { id });
 export const deleteExam = (id: string) => invoke<void>("delete_exam", { id });
 
-// ---- lecture recording (Whisper) ----
+// ---- lecture recording ----
 export const saveRecording = (
   subjectId: string,
   name: string,
   audio: number[],
   topicId?: string,
-  ext?: string
-) => invoke<IngestResult>("save_recording", { subjectId, name, audio, topicId, ext });
+  ext?: string,
+  diarize?: boolean,
+  liveTranscript?: string,
+) => invoke<IngestResult>("save_recording", {
+  subjectId, name, audio, topicId, ext, diarize, liveTranscript,
+});
 
 /** Raw-bytes save: the audio rides the invoke body as-is (no JSON number[]),
  * which is the only sane transport for hour-long recordings (~100MB). Metadata
  * travels in headers (percent-encoded — header values must be ASCII-safe). */
+export class TranscriptSaveError extends Error {
+  constructor(public sourceId: string, cause: unknown) {
+    super(`Audio saved, but the transcript could not be saved. Retry to save the transcript: ${cause}`);
+    this.name = "TranscriptSaveError";
+  }
+}
+
+export const commitLiveTranscript = (sourceId: string, transcript: string) =>
+  invoke<void>("commit_live_transcript", { sourceId, transcript });
+
 export const saveRecordingRaw = (
   subjectId: string,
   name: string,
   audio: Uint8Array,
   topicId?: string,
   ext?: string,
-  diarize?: boolean
-) =>
-  invoke<IngestResult>("save_recording_raw", audio, {
+  diarize?: boolean,
+  liveTranscript?: string,
+) => {
+  const transcript = liveTranscript?.trim() || "";
+  return invoke<IngestResult>("save_recording_raw", audio, {
     headers: {
       "x-subject-id": encodeURIComponent(subjectId),
       "x-name": encodeURIComponent(name),
       ...(topicId ? { "x-topic-id": encodeURIComponent(topicId) } : {}),
       ...(ext ? { "x-ext": encodeURIComponent(ext) } : {}),
       ...(diarize !== undefined ? { "x-diarize": String(diarize) } : {}),
+      ...(transcript ? { "x-live-transcript-pending": "true" } : {}),
     },
+  }).then(async (result) => {
+    if (!transcript) return result;
+    try {
+      await commitLiveTranscript(result.source.id, transcript);
+    } catch (error) {
+      throw new TranscriptSaveError(result.source.id, error);
+    }
+    return result;
   });
+};
 
 // Near-live transcription: transcribe an audio slice and return its text (or ""
 // if no Whisper transcriber is installed). Used by the recorder's live panel.
@@ -457,12 +483,17 @@ export const checkWhisperModel = () => invoke<string>("check_whisper_model");
 // WKWebView's custom-scheme pages are not a secure context, so getUserMedia is
 // unavailable on iOS — capture runs natively (AVAudioRecorder) behind these
 // commands instead, and keeps recording while the phone is locked.
-export const nativeRecStart = () => invoke<void>("native_rec_start");
+export const nativeRecStart = (includeMicrophone = true, includeSystemAudio = false) =>
+  invoke<void>("native_rec_start", { includeMicrophone, includeSystemAudio });
 export const nativeRecPause = () => invoke<void>("native_rec_pause");
+export const translateCaption = (text: string, target: string, draft = false, context = "") =>
+  invoke<string>("translate_caption", { text, target, draft, context });
+export const nativeRecChunk = (cursor: number, preserveSilence = false) =>
+  invoke<{ audio: number[]; cursor: number }>("native_rec_chunk", { cursor, preserveSilence });
 export const nativeRecResume = () => invoke<void>("native_rec_resume");
 /** Stop and return the recorded file's path + duration (secs). */
 export const nativeRecStop = () =>
-  invoke<{ path: string; secs: number }>("native_rec_stop");
+  invoke<{ path: string; secs: number; ext: string }>("native_rec_stop");
 export const nativeRecCancel = () => invoke<void>("native_rec_cancel");
 /** Metering sample: input level 0..1 for the waveform + authoritative elapsed
  * seconds (webview timers freeze while the phone is locked; the recorder's
@@ -478,8 +509,11 @@ export const saveRecordingPath = (
   name: string,
   path: string,
   topicId?: string,
-  diarize?: boolean
-) => invoke<IngestResult>("save_recording_path", { subjectId, name, path, topicId, diarize });
+  diarize?: boolean,
+  liveTranscript?: string,
+) => invoke<IngestResult>("save_recording_path", {
+  subjectId, name, path, topicId, diarize, liveTranscript,
+});
 
 // ---- settings (bulk) ----
 export const getAllSettings = () => invoke<Record<string, string>>("get_all_settings");
@@ -579,6 +613,8 @@ export const pingUrl = (url: string) => invoke<boolean>("ping_url", { url });
 
 /** Models actually installed on the configured Ollama server (local or homelab). Empty when unreachable / none pulled. */
 export const ollamaModels = () => invoke<string[]>("ollama_models");
+/** Models currently exposed by the configured LM Studio OpenAI-compatible server. */
+export const lmstudioModels = () => invoke<string[]>("lmstudio_models");
 /** Lightweight authenticated probe of a provider's stored key/url. provider: gemini|openrouter|openai|claude|custom|ollama. */
 export interface VerifyResult { ok: boolean; detail: string }
 export const verifyProvider = (provider: string) =>
@@ -740,6 +776,11 @@ export const setEventStatus = (id: string, status: "todo" | "doing" | "done") =>
   invoke<CalEvent>("set_event_status", { id, status });
 /** Open an http(s) URL in the system browser (webview <a target=_blank> is a no-op in Tauri). */
 export const openExternal = (url: string) => invoke<void>("open_external", { url });
+/** Open the OS microphone privacy pane (desktop only). */
+export const openMicrophoneSettings = () => invoke<void>("open_microphone_settings");
+export const openSystemAudioSettings = () => invoke<void>("open_system_audio_settings");
+/** Compiled Tauri backend platform (for native feature gates). */
+export const runtimePlatform = () => invoke<string>("runtime_platform");
 /** Set the deadline study checklist (ticked topic ids). */
 export const setEventChecklist = (id: string, topicIds: string[]) =>
   invoke<CalEvent>("set_event_checklist", { id, topicIds });

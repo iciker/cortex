@@ -1,6 +1,6 @@
 [package]
 name = "cortex"
-version = "1.0.35"
+version = "1.0.37"
 description = "Cortex — desktop study OS"
 authors = ["Aidan McConnon"]
 license = "Apache-2.0"
@@ -68,6 +68,11 @@ tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"] }
 tauri = { version = "2", features = ["tray-icon"] }
 tauri-plugin-single-instance = "2"
 tauri-plugin-updater = "2"
+
+# macOS 15+: optional combined microphone + system-audio lecture recording.
+# ScreenCaptureKit supplies both audio streams without a virtual loopback device.
+[target.'cfg(target_os = "macos")'.dependencies]
+screencapturekit = { version = "8.0.1", features = ["macos_15_0"] }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

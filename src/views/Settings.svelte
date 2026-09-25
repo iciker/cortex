@@ -1,7 +1,7 @@
 <script lang="ts">
   import { app, THEMES, THEME_LABELS } from "../lib/store.svelte";
   import type { Theme } from "../lib/store.svelte";
-  import { isMobile } from "../lib/platform";
+  import { isMacOS, isMobile } from "../lib/platform";
   import * as api from "../lib/api";
   import { getVersion } from "@tauri-apps/api/app";
   import type { Memory } from "../lib/api";
@@ -141,6 +141,10 @@
       { id: "qwen2.5:32b",   label: "Qwen 2.5 32B — local" },
       { id: "llama3.3:70b",  label: "Llama 3.3 70B — local, heavy" },
     ] },
+    { id: "lmstudio", label: "LM Studio (local)", models: [
+      { id: "qwen3.5-4b-mlx",  label: "Qwen3.5 4B — live draft" },
+      { id: "qwen3.8-27b-mlx", label: "Qwen3.8 27B — final quality" },
+    ] },
     { id: "custom", label: "Custom endpoint", models: [] },
   ];
   const EMBED_PROVIDERS: { id: string; label: string; models: Model[] }[] = [
@@ -150,6 +154,8 @@
   ];
   const MODEL_TASKS = [
     { id: "chat",       label: "Chat",                  desc: "Scoped Q&A across sources" },
+    { id: "caption_draft", label: "Live caption draft", desc: "Fast provisional translation" },
+    { id: "caption_final", label: "Final caption",      desc: "Whole-sentence correction" },
     { id: "cheatsheet", label: "Cheatsheet synthesis",  desc: "Completeness-checked merges" },
     { id: "audio",      label: "Audio overview script", desc: "Two-host podcast dialogue" },
     { id: "quiz",       label: "Quiz generation",       desc: "MCQ · short answer · cloze" },
@@ -201,12 +207,13 @@
 
   // ---- models state ----
   type TaskAssign = { provider: string; model: string; budget: string };
-  // Defaults: DeepSeek V4 Flash (via OpenRouter) for ALL text generation —
-  // extremely cheap ($0.09/$0.18 per Mtok), 1M context, fast and non-reasoning.
-  // Falls back to any configured key if OpenRouter isn't set (see
-  // llm::from_spec_or_any). Embeddings stay on Gemini (DeepSeek doesn't embed).
+  // Realtime captions use a small local model for drafts and a stronger local
+  // model for final sentences. Other text generation defaults to DeepSeek V4
+  // Flash through OpenRouter; embeddings stay on Gemini.
   let assign = $state<Record<TaskId, TaskAssign>>({
     chat:       { provider: "openrouter", model: "deepseek/deepseek-v4-flash", budget: "8000" },
+    caption_draft: { provider: "lmstudio", model: "qwen3.5-4b-mlx", budget: "96" },
+    caption_final: { provider: "lmstudio", model: "qwen3.8-27b-mlx", budget: "512" },
     cheatsheet: { provider: "openrouter", model: "deepseek/deepseek-v4-flash", budget: "32000" },
     audio:      { provider: "openrouter", model: "deepseek/deepseek-v4-flash", budget: "16000" },
     quiz:       { provider: "openrouter", model: "deepseek/deepseek-v4-flash", budget: "8000" },
@@ -224,6 +231,8 @@
     gemini: "",
     claude: "",
     openai: "",
+    lmstudio_url: "http://127.0.0.1:1234/v1",
+    lmstudio_api_key: "",
     custom_endpoint: "",
     custom_api_key: "",
   });
@@ -241,6 +250,8 @@
     gemini: false,
     claude: false,
     openai: false,
+    lmstudio_url: false,
+    lmstudio_api_key: false,
     custom_endpoint: false,
     custom_api_key: false,
   });
@@ -377,11 +388,56 @@
   }
 
   // ---- transcription mode (Settings → Integrations → Transcription) ----
-  // "local" = on this machine (zero setup) · "cloud" = OpenAI-compatible API
-  // with a key (Groq/OpenAI/custom) · "homelab" = the /whisper service behind
-  // the Homelab URL. Unset falls back to the legacy auto behavior (homelab if
-  // configured, else local) — shown as whichever of those applies.
-  let transcriptionMode = $state<"local" | "cloud" | "homelab">("local");
+  // "realtime" saves Voxtral's completed captions and never calls Whisper.
+  // The other modes remain available as an explicit refinement/fallback choice.
+  type TranscriptionMode = "realtime" | "local" | "cloud" | "homelab";
+  let transcriptionMode = $state<TranscriptionMode>("realtime");
+  let liveAsrProvider = $state("whisper");
+  let vibevoiceUrl = $state("http://127.0.0.1:7870");
+  let vibevoiceToken = $state("");
+  let vibevoiceNote = $state("");
+  let vibevoiceTesting = $state(false);
+  let translationNote = $state("");
+  let translationTesting = $state(false);
+  async function testLiveTranslation() {
+    translationTesting = true;
+    translationNote = "";
+    try { translationNote = await api.translateCaption("Today we are studying English pronunciation.", "zh-CN"); }
+    catch (error) { translationNote = String(error); }
+    finally { translationTesting = false; }
+  }
+  async function saveLiveAsr() {
+    try {
+      const { realtimeSocketUrl } = await import("../lib/vibevoice");
+      if (liveAsrProvider === "voxtral") realtimeSocketUrl(vibevoiceUrl);
+      if (liveAsrProvider === "voxtral") transcriptionMode = "realtime";
+      else if (transcriptionMode === "realtime") transcriptionMode = "local";
+      await api.setSettings({
+        live_asr_provider: liveAsrProvider,
+        vibevoice_url: vibevoiceUrl.trim(),
+        vibevoice_token: vibevoiceToken,
+        transcription_mode: transcriptionMode,
+      });
+      vibevoiceNote = "Saved";
+    } catch (error) { vibevoiceNote = String(error); }
+  }
+  async function testLiveAsr() {
+    vibevoiceTesting = true;
+    vibevoiceNote = "";
+    try {
+      const { VoxtralCaptions } = await import("../lib/vibevoice");
+      let failure = "";
+      const session = new VoxtralCaptions(vibevoiceUrl, vibevoiceToken, async () => null,
+        async () => "", () => {}, (error) => { failure = error; });
+      await session.finish();
+      if (failure) throw new Error(failure);
+      vibevoiceNote = "Voxtral connected";
+    } catch (error) { vibevoiceNote = String(error); }
+    finally { vibevoiceTesting = false; }
+  }
+  let recordMicrophone = $state(true);
+  let recordSystemAudio = $state(false);
+  let showSystemAudio = $state(isMacOS);
   let whisperCloudProvider = $state<"groq" | "openai" | "custom">("groq");
   let whisperCloudUrl = $state("");
   let whisperCloudModel = $state("");
@@ -390,17 +446,34 @@
     groq: { url: "https://api.groq.com/openai/v1", model: "whisper-large-v3-turbo" },
     openai: { url: "https://api.openai.com/v1", model: "whisper-1" },
   } as const;
-  function setTranscriptionMode(m: "local" | "cloud" | "homelab") {
+  function setTranscriptionMode(m: TranscriptionMode) {
     transcriptionMode = m;
+    if (m === "realtime") liveAsrProvider = "voxtral";
     whisperCheckState = null;
     whisperCheckNote = "";
-    api.setSetting("transcription_mode", m).catch(() => {});
+    api.setSettings({
+      transcription_mode: m,
+      ...(m === "realtime" ? { live_asr_provider: "voxtral" } : {}),
+    }).catch(() => {});
     // Entering cloud mode with everything blank: land on the Groq preset so the
     // only thing left to do is paste a key.
     if (m === "cloud" && !whisperCloudUrl.trim() && !whisperCloudModel.trim()) {
       applyCloudPreset("groq");
     }
   }
+  function toggleSystemAudio() {
+    recordSystemAudio = !recordSystemAudio;
+    api.setSetting("record_system_audio", recordSystemAudio ? "true" : "false").catch(() => {});
+  }
+  function toggleMicrophone() {
+    recordMicrophone = !recordMicrophone;
+    api.setSetting("record_microphone", recordMicrophone ? "true" : "false").catch(() => {});
+  }
+  $effect(() => {
+    void api.runtimePlatform()
+      .then((platform) => (showSystemAudio = platform === "macos"))
+      .catch(() => {});
+  });
   function applyCloudPreset(p: "groq" | "openai" | "custom") {
     whisperCloudProvider = p;
     api.setSetting("whisper_cloud_provider", p).catch(() => {});
@@ -1003,11 +1076,13 @@
       if (s.gemini_api_key)     keys = { ...keys, gemini: s.gemini_api_key };
       if (s.claude_api_key)     keys = { ...keys, claude: s.claude_api_key };
       if (s.openai_api_key)     keys = { ...keys, openai: s.openai_api_key };
+      if (s.lmstudio_url)       keys = { ...keys, lmstudio_url: s.lmstudio_url };
+      if (s.lmstudio_api_key)   keys = { ...keys, lmstudio_api_key: s.lmstudio_api_key };
       if (s.custom_endpoint)    keys = { ...keys, custom_endpoint: s.custom_endpoint };
       if (s.custom_api_key)     keys = { ...keys, custom_api_key: s.custom_api_key };
 
       // Models
-      for (const taskId of ["chat","cheatsheet","audio","quiz","flashcard","embedding"] as TaskId[]) {
+      for (const taskId of ["chat","caption_draft","caption_final","cheatsheet","audio","quiz","flashcard","embedding"] as TaskId[]) {
         const raw = s[`model_${taskId}`];
         if (raw) {
           const sep = raw.indexOf(":");
@@ -1031,14 +1106,21 @@
       if (s.searxng_url)                   searxng  = s.searxng_url;
       if (s.whisper_url)                   whisperUrl = s.whisper_url;
       if (s.whisper_model)                 whisperModel = s.whisper_model;
+      const { normalizeLiveAsrProvider } = await import("../lib/realtime-asr");
+      liveAsrProvider = normalizeLiveAsrProvider(s.live_asr_provider);
+      if (s.vibevoice_url) vibevoiceUrl = s.vibevoice_url;
+      if (s.vibevoice_token) vibevoiceToken = s.vibevoice_token;
+      recordMicrophone = s.record_microphone !== "false";
+      recordSystemAudio = s.record_system_audio === "true";
       // Transcription mode + cloud provider. Unset mode = legacy auto: homelab
       // when any whisper/homelab URL is configured, otherwise local.
-      if (s.transcription_mode === "local" || s.transcription_mode === "cloud" || s.transcription_mode === "homelab") {
+      if (s.transcription_mode === "realtime" || s.transcription_mode === "local" || s.transcription_mode === "cloud" || s.transcription_mode === "homelab") {
         transcriptionMode = s.transcription_mode;
       } else {
-        transcriptionMode =
-          (s.whisper_url || s.homelab_base || s.homelab_tailscale_base || s.homelab_public_base)
-            ? "homelab" : "local";
+        transcriptionMode = liveAsrProvider === "voxtral"
+          ? "realtime"
+          : (s.whisper_url || s.homelab_base || s.homelab_tailscale_base || s.homelab_public_base)
+              ? "homelab" : "local";
       }
       if (s.whisper_cloud_provider === "groq" || s.whisper_cloud_provider === "openai" || s.whisper_cloud_provider === "custom") whisperCloudProvider = s.whisper_cloud_provider;
       if (s.whisper_cloud_url)   whisperCloudUrl = s.whisper_cloud_url;
@@ -1116,16 +1198,26 @@
       .catch(() => app.pushToast({ kind: "error", title: "Save failed" }));
   }
 
-  function saveKeys() {
-    api.setSettings({
-      openrouter_api_key: keys.openrouter,
-      gemini_api_key:     keys.gemini,
-      claude_api_key:     keys.claude,
-      openai_api_key:     keys.openai,
-      custom_endpoint:    keys.custom_endpoint,
-      custom_api_key:     keys.custom_api_key,
-    }).then(() => app.pushToast({ kind: "success", title: "Keys saved", body: "Stored in the system keychain." }))
-      .catch(() => app.pushToast({ kind: "error", title: "Save failed" }));
+  async function saveKeys(): Promise<boolean> {
+    try {
+      await api.setSettings({
+        openrouter_api_key: keys.openrouter,
+        gemini_api_key:     keys.gemini,
+        claude_api_key:     keys.claude,
+        openai_api_key:     keys.openai,
+        lmstudio_url:       keys.lmstudio_url,
+        lmstudio_api_key:   keys.lmstudio_api_key,
+        ollama_url:         endpoint.trim(),
+        custom_endpoint:    keys.custom_endpoint,
+        custom_api_key:     keys.custom_api_key,
+      });
+      invalidateLmStudioModels();
+      app.pushToast({ kind: "success", title: "Provider settings saved", body: "Secrets are stored in the system keychain." });
+      return true;
+    } catch {
+      app.pushToast({ kind: "error", title: "Save failed" });
+      return false;
+    }
   }
 
   // Live OpenRouter catalog for the searchable model picker — fetched once, on the
@@ -1152,7 +1244,9 @@
     const np = provList.find((x) => x.id === p) ?? provList[0];
     // Ollama → default to the first INSTALLED model (empty if none pulled, which leaves
     // the picker blank as intended). Others → the provider's first curated model.
-    const firstModel = p === "ollama" || p === "custom" ? "" : (np.models[0]?.id ?? "");
+    const firstModel = p === "ollama" || p === "custom" ? ""
+      : p === "lmstudio" && taskId === "caption_final" ? "qwen3.8-27b-mlx"
+      : (np.models[0]?.id ?? "");
     setTask(taskId, { provider: p, model: firstModel });
     const kv: Record<string, string> = { [`model_${taskId}`]: p + ":" + firstModel };
     if (taskId === "embedding") kv.embed_provider = p;
@@ -1179,6 +1273,40 @@
   // lazily next time the picker opens, so we don't fire a network call per keystroke.
   function invalidateOllamaModels() { ollamaLoaded = false; ollamaInstalled = []; }
 
+  // LM Studio exposes its currently available models through the OpenAI-compatible
+  // GET /v1/models route. Load lazily when a picker opens and retain manual entry as
+  // the fallback when the local server is stopped or returns an empty catalog.
+  let lmstudioInstalled = $state<Model[]>([]);
+  let lmstudioLoaded = false;
+  let lmstudioLoading = $state(false);
+  let lmstudioLoadFailed = $state(false);
+  let lmstudioGeneration = 0;
+  async function ensureLmStudioModels() {
+    if (lmstudioLoaded || lmstudioLoading) return;
+    const generation = lmstudioGeneration;
+    lmstudioLoading = true;
+    lmstudioLoadFailed = false;
+    try {
+      const installed = (await api.lmstudioModels()).map((id) => ({ id, label: id }));
+      if (generation !== lmstudioGeneration) return;
+      lmstudioInstalled = installed;
+      lmstudioLoaded = true;
+    } catch {
+      if (generation !== lmstudioGeneration) return;
+      lmstudioInstalled = [];
+      lmstudioLoadFailed = true;
+    } finally {
+      if (generation === lmstudioGeneration) lmstudioLoading = false;
+    }
+  }
+  function invalidateLmStudioModels() {
+    lmstudioGeneration += 1;
+    lmstudioLoaded = false;
+    lmstudioLoading = false;
+    lmstudioInstalled = [];
+    lmstudioLoadFailed = false;
+  }
+
   // Is local-model (Ollama) usage available here? On desktop, always (localhost). On
   // mobile there is no localhost Ollama, so it needs a homelab base (or an explicit
   // non-localhost Ollama URL) to be reachable.
@@ -1200,6 +1328,7 @@
   function modelOptionsFor(prov: { id: string; models: Model[] }) {
     if (prov.id === "openrouter" && orModels.length) return orModels;
     if (prov.id === "ollama") return ollamaInstalled.map((id) => ({ id, label: id }));
+    if (prov.id === "lmstudio") return lmstudioInstalled;
     return prov.models.map((m) => ({ id: m.id, label: m.label }));
   }
 
@@ -1219,18 +1348,38 @@
   const statusLabel = (v: VerifyState, isSet = false) =>
     v === "checking" ? "checking…" : v ? (v.ok ? "connected" : v.detail) : (isSet ? "not checked" : "not set");
   const verifyIdForKey = (id: string) =>
-    id === "custom_endpoint" || id === "custom_api_key" ? "custom" : id;
+    id === "custom_endpoint" || id === "custom_api_key" ? "custom"
+    : id === "lmstudio_url" || id === "lmstudio_api_key" ? "lmstudio"
+    : id;
   async function verifyKey(id: string) {
     const vid = verifyIdForKey(id);
     verify = { ...verify, [vid]: "checking" };
     try { verify = { ...verify, [vid]: await api.verifyProvider(vid) }; }
     catch (e) { verify = { ...verify, [vid]: { ok: false, detail: String(e) } }; }
   }
+  async function verifyLocalProvider(id: "ollama" | "lmstudio") {
+    try {
+      if (id === "lmstudio") {
+        await api.setSettings({
+          lmstudio_url: keys.lmstudio_url.trim(),
+          lmstudio_api_key: keys.lmstudio_api_key,
+        });
+        invalidateLmStudioModels();
+      } else if (!isMobile) {
+        await api.setSettings({ ollama_url: endpoint.trim() });
+        invalidateOllamaModels();
+      }
+      await verifyKey(id);
+    } catch (e) {
+      verify = { ...verify, [id]: { ok: false, detail: String(e) } };
+    }
+  }
   // Verify every provider that has a stored key (run on load + after Save keys).
   function verifyAllKeys() {
     for (const k of keyMeta) {
       if (keys[k.id as keyof typeof keys]?.trim()) void verifyKey(k.id);
     }
+    if (keys.lmstudio_url.trim()) void verifyKey("lmstudio");
     if (ollamaAvailable) void verifyKey("ollama");
   }
 
@@ -1451,7 +1600,8 @@ Notes: {about}</pre>
             {@const prov = allProv.find((p) => p.id === a.provider) ?? provList[0]}
             {@const isOr = a.provider === "openrouter"}
             {@const isOllama = a.provider === "ollama"}
-            {@const isCustom = a.provider === "custom"}
+            {@const isLmStudio = a.provider === "lmstudio"}
+            {@const isCustom = a.provider === "custom" || a.provider === "lmstudio"}
             <div class="mt-row">
               <div class="mt-task">
                 <div class="mt-task-t">{t.label}</div>
@@ -1462,17 +1612,18 @@ Notes: {about}</pre>
                 onChange={(p) => onModelProviderChange(t.id, p)}
                 options={provList.map((p) => ({ id: p.id, label: p.label }))}
               />
-              <!-- OpenRouter → live searchable catalog (curated list as offline/pre-fetch
-                   fallback); Ollama → only models actually installed (empty ⇒ nothing to
-                   pick); every other provider → its own curated list, still searchable. -->
+              <!-- OpenRouter → live searchable catalog; Ollama and LM Studio → models
+                   reported by their configured local services; every other provider →
+                   its curated list. Custom ids remain available where supported. -->
               <ModelSearch
                 value={a.model}
                 onChange={(m) => onModelChange(t.id, m)}
                 options={modelOptionsFor(prov)}
-                loading={isOr && orLoading}
-                onOpen={isOr ? ensureOrModels : (isOllama ? ensureOllamaModels : undefined)}
+                loading={isOr ? orLoading : (isLmStudio && lmstudioLoading)}
+                onOpen={isLmStudio ? ensureLmStudioModels : (isOr ? ensureOrModels : (isOllama ? ensureOllamaModels : undefined))}
                 allowCustom={isCustom}
-                placeholder={isCustom ? "Type model id, e.g. qwen-plus" : (isOr ? "Search OpenRouter…" : (isOllama ? (ollamaInstalled.length ? "Pick an installed model" : "No models installed") : undefined))}
+                emptyText={isLmStudio ? (lmstudioLoadFailed ? "Couldn’t reach LM Studio — type a model id" : "No models returned by LM Studio — type a model id") : undefined}
+                placeholder={a.provider === "lmstudio" ? "Type loaded model id, e.g. qwen3.8-27b-mlx" : (isCustom ? "Type model id, e.g. qwen-plus" : (isOr ? "Search OpenRouter…" : (isOllama ? (ollamaInstalled.length ? "Pick an installed model" : "No models installed") : undefined)))}
               />
               {#if t.id === "embedding"}
                 <span class="mono faint mt-budget-na">n/a</span>
@@ -1489,7 +1640,7 @@ Notes: {about}</pre>
 
         <div class="set-note mono">
           <Icon name="diamond" size={11} color="var(--accent)" />
-          Ollama tasks run fully offline on this machine or your homelab — no key required.
+          Ollama and LM Studio can run tasks locally; choose either provider separately for each task.
         </div>
       </div>
 
@@ -1557,19 +1708,23 @@ Notes: {about}</pre>
           </div>
         </section>
 
-        <!-- Local models (Ollama) — keyless; a URL, not a key. On mobile Ollama is
-             reached only through the Homelab (no localhost on a phone). -->
-        {#if ollamaAvailable}
-        {@const ov = verify.ollama}
+        <!-- Local OpenAI-compatible model services. Ollama is reached through the
+             Homelab on mobile because a phone cannot use the desktop's localhost. -->
         <section class="set-group">
-          <div class="set-group-h"><h3 class="set-group-t">Local models (Ollama)</h3></div>
+          <div class="set-group-h">
+            <div>
+              <h3 class="set-group-t">Local model services</h3>
+              <p class="set-group-d">Configure Ollama and LM Studio here, then choose either provider separately for each task in Models.</p>
+            </div>
+          </div>
           <div class="set-card">
+            {#if ollamaAvailable}
             <div class="set-row stacked">
               <div class="set-row-l">
                 <div class="set-row-t">
                   <span class="row-keytitle">
                     Ollama URL
-                    <span class={statusClass(ov)}>{statusLabel(ov)}</span>
+                    <span class={statusClass(verify.ollama)}>{statusLabel(verify.ollama, !!ollamaDisplayUrl)}</span>
                   </span>
                 </div>
                 <div class="set-row-d">
@@ -1592,16 +1747,58 @@ Notes: {about}</pre>
                     spellcheck={false}
                   />
                 {/if}
-                <button type="button" class="btn btn--ghost btn--sm" style="margin-top:6px" onclick={() => verifyKey("ollama")}>Verify</button>
+                <button type="button" class="btn btn--ghost btn--sm" style="margin-top:6px" onclick={() => verifyLocalProvider("ollama")}>Verify</button>
+              </div>
+            </div>
+            {/if}
+
+            <div class="set-row stacked">
+              <div class="set-row-l">
+                <div class="set-row-t">
+                  <span class="row-keytitle">
+                    <span data-i18n-skip>LM Studio</span>
+                    <span class={statusClass(verify.lmstudio)}>{statusLabel(verify.lmstudio, !!keys.lmstudio_url.trim())}</span>
+                  </span>
+                </div>
+                <div class="set-row-d">OpenAI-compatible local server. Authentication is optional.</div>
+              </div>
+              <div class="set-row-r" style="display:flex;flex-direction:column;gap:8px">
+                <input
+                  class="input mono"
+                  value={keys.lmstudio_url}
+                  oninput={(e) => { keys = { ...keys, lmstudio_url: (e.target as HTMLInputElement).value }; verify = { ...verify, lmstudio: null }; invalidateLmStudioModels(); }}
+                  placeholder="http://127.0.0.1:1234/v1"
+                  aria-label="LM Studio URL"
+                  spellcheck={false}
+                />
+                <div class="masked">
+                  <input
+                    class="input mono"
+                    type={showKey.lmstudio_api_key ? "text" : "password"}
+                    value={keys.lmstudio_api_key}
+                    oninput={(e) => { keys = { ...keys, lmstudio_api_key: (e.target as HTMLInputElement).value }; verify = { ...verify, lmstudio: null }; invalidateLmStudioModels(); }}
+                    placeholder="LM Studio API token (optional)"
+                    aria-label="LM Studio API token"
+                    spellcheck={false}
+                  />
+                  <button
+                    type="button"
+                    class="masked-eye"
+                    onclick={() => { showKey = { ...showKey, lmstudio_api_key: !showKey.lmstudio_api_key }; }}
+                    title={showKey.lmstudio_api_key ? "Hide" : "Show"}
+                  >
+                    <Icon name={showKey.lmstudio_api_key ? "x" : "search"} size={13} />
+                  </button>
+                </div>
+                <button type="button" class="btn btn--ghost btn--sm" onclick={() => verifyLocalProvider("lmstudio")}>Verify</button>
               </div>
             </div>
           </div>
         </section>
-        {/if}
 
         <div class="set-foot-actions">
-          <button class="btn btn--primary" onclick={() => { saveKeys(); verifyAllKeys(); }}>
-            <Icon name="check" size={13} /> Save keys
+          <button class="btn btn--primary" onclick={async () => { if (await saveKeys()) verifyAllKeys(); }}>
+            <Icon name="check" size={13} /> Save provider settings
           </button>
         </div>
       </div>
@@ -1922,17 +2119,59 @@ Notes: {about}</pre>
         <!-- ═══ TRANSCRIPTION — outcome-first: pick WHERE audio becomes text ═══ -->
         <section class="set-group">
           <div class="set-group-h">
+            <h3 class="set-group-t">Live speech recognition</h3>
+            <p class="set-group-d">Completed live captions can be saved directly. Choose below whether Whisper is available for refinement.</p>
+          </div>
+          <div class="set-card">
+            <div class="set-row">
+              <label for="live-asr-provider">Provider</label>
+              <select id="live-asr-provider" class="input" bind:value={liveAsrProvider}>
+                <option value="whisper">Existing transcription service</option>
+                <option value="voxtral" data-i18n-skip>Voxtral Realtime 4B</option>
+              </select>
+            </div>
+            {#if liveAsrProvider === "voxtral"}
+              <div class="set-row stacked">
+                <label for="vibevoice-url">Voxtral gateway address</label>
+                <input id="vibevoice-url" class="input mono" bind:value={vibevoiceUrl} placeholder="http://127.0.0.1:7870" />
+                <div class="set-row-d">Use the Mac Studio LAN address on your laptop. Localhost refers to the computer running Cortex.</div>
+              </div>
+              <div class="set-row stacked">
+                <label for="vibevoice-token">Voxtral access token</label>
+                <input id="vibevoice-token" type="password" class="input mono" bind:value={vibevoiceToken} autocomplete="off" />
+                <div class="set-row-d">Required for LAN access. Use HTTPS when the network is not trusted.</div>
+              </div>
+            {/if}
+            <div class="set-row">
+              <button class="btn btn--sm" onclick={saveLiveAsr}>Save</button>
+              {#if liveAsrProvider === "voxtral"}
+                <button class="btn btn--sm btn--ghost" onclick={testLiveAsr} disabled={vibevoiceTesting}>Test Voxtral</button>
+              {/if}
+              <span role="status">{vibevoiceNote}</span>
+            </div>
+            <div class="set-row stacked">
+              <div class="set-row-d">Draft and final translation models are selected under Models.</div>
+              <button class="btn btn--sm btn--ghost" onclick={testLiveTranslation} disabled={translationTesting}>Test translation</button>
+              {#if translationNote}<p role="status" data-i18n-skip>{translationNote}</p>{/if}
+            </div>
+          </div>
+        </section>
+        <section class="set-group">
+          <div class="set-group-h">
             <h3 class="set-group-t">Transcription</h3>
             <p class="set-group-d">Where lecture recordings become text.</p>
           </div>
           <div class="set-card">
             <div class="set-row stacked">
               <div class="seg">
+                <button type="button" class={"seg-opt" + (transcriptionMode === "realtime" ? " on" : "")} onclick={() => setTranscriptionMode("realtime")}>Realtime only</button>
                 <button type="button" class={"seg-opt" + (transcriptionMode === "local" ? " on" : "")} onclick={() => setTranscriptionMode("local")}>This computer</button>
                 <button type="button" class={"seg-opt" + (transcriptionMode === "cloud" ? " on" : "")} onclick={() => setTranscriptionMode("cloud")}>Cloud API</button>
                 <button type="button" class={"seg-opt" + (transcriptionMode === "homelab" ? " on" : "")} onclick={() => setTranscriptionMode("homelab")}>My homelab</button>
               </div>
-              {#if transcriptionMode === "local"}
+              {#if transcriptionMode === "realtime"}
+                <div class="set-row-d">Uses completed Voxtral captions directly. Whisper is never started, downloaded or called. If live recognition fails, Cortex keeps the audio and any partial captions without retranscribing.</div>
+              {:else if transcriptionMode === "local"}
                 <div class="set-row-d">Zero setup — Whisper runs on this machine, and the first transcription fetches its model automatically. Most private; slower on long lectures than the other two.</div>
               {:else if transcriptionMode === "cloud"}
                 <div class="set-row-d">No server, no hosting — just an API key. Groq's free tier turns a whole lecture into text in seconds with <span class="mono">large-v3-turbo</span>.</div>
@@ -1981,7 +2220,7 @@ Notes: {about}</pre>
               </div>
             {/if}
 
-            {#if transcriptionMode !== "local"}
+            {#if transcriptionMode === "cloud" || transcriptionMode === "homelab"}
               <div class="set-row stacked">
                 <div class="row-inline">
                   <button class="btn" onclick={checkWhisper} disabled={whisperCheckState === "checking"}>
@@ -2214,6 +2453,37 @@ Notes: {about}</pre>
           <h1 class="set-title">Study sound & voices</h1>
           <p class="set-sub">Defaults for the music player and generated audio overviews.</p>
         </header>
+
+        {#if !isMobile}
+          <section class="set-group">
+            <div class="set-group-h"><h3 class="set-group-t">Recording input</h3></div>
+            <div class="set-card">
+              <div class="set-row">
+                <div class="set-row-l">
+                  <div class="set-row-t">Microphone input</div>
+                  <div class="set-row-d">Capture your voice and nearby sound from the selected microphone.</div>
+                </div>
+                <div class="set-row-r">
+                  <button type="button" class={"st-toggle" + (recordMicrophone ? " on" : "")} onclick={toggleMicrophone} role="switch" aria-checked={recordMicrophone} aria-label="microphone input"><span class="st-knob"></span></button>
+                </div>
+              </div>
+              {#if showSystemAudio}
+                <div class="set-row">
+                  <div class="set-row-l">
+                    <div class="set-row-t">System audio input</div>
+                    <div class="set-row-d">Capture sound played by this Mac.</div>
+                    {#if recordSystemAudio}
+                    <div class="set-row-d">System audio capture requires macOS 15 or later and Screen Recording permission.</div>
+                    {/if}
+                  </div>
+                  <div class="set-row-r">
+                    <button type="button" class={"st-toggle" + (recordSystemAudio ? " on" : "")} onclick={toggleSystemAudio} role="switch" aria-checked={recordSystemAudio} aria-label="system audio input"><span class="st-knob"></span></button>
+                  </div>
+                </div>
+              {/if}
+            </div>
+          </section>
+        {/if}
 
         <!-- Music is cut on mobile (no mpv/yt-dlp sidecars) — hide its settings. -->
         {#if !isMobile}

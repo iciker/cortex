@@ -19,19 +19,19 @@
 // ─────────────────────────────────────────────────────────────────────────────
 import * as api from "./api";
 import { app } from "./store.svelte";
-import { isIOS, isMobile } from "./platform";
+import { isIOS, isMacOS, isMobile } from "./platform";
+import { describeMicrophoneFailure } from "./recorder-errors";
+import { hasRecordingInput, recordingInputs } from "./recording-input";
+import { formatBilingualTranscript, LiveCaptions, type Caption } from "./live-captions";
+import { normalizeLiveAsrProvider } from "./realtime-asr";
+import { VoxtralCaptions } from "./vibevoice";
+import {
+  prepareCaptionAudioCapture,
+  startCaptionAudioCapture,
+  type CaptionAudioCapture,
+} from "./caption-audio";
 
-// Live (interim) transcription via the platform SpeechRecognition, where it exists.
-const SR: any =
-  typeof window !== "undefined"
-    ? (window as any).SpeechRecognition || (window as any).webkitSpeechRecognition
-    : undefined;
-export const liveTranscriptSupported = !!SR;
-
-// ~7s cadence feels real-time and local faster-whisper clears a 7s clip in ~1-2s.
-// The loop is ADAPTIVE: it never starts a second transcription while one is in
-// flight — the pending slice simply grows until the round-trip returns.
-const SEG_MS = 7000;
+const SEG_MS = 4000;
 // Below this mean |amplitude| (normalized 0-1) a WAV segment is treated as a
 // pause and skipped — no whisper call, no UI change.
 const SILENCE_RMS = 0.006;
@@ -88,22 +88,26 @@ class RecorderStore {
   secs = $state(0);
   status = $state<"ready" | "recording" | "review" | "transcribing" | "done">("ready");
   errorMsg = $state<string | null>(null);
+  canOpenMicrophoneSettings = $state(false);
+  canOpenSystemAudioSettings = $state(false);
   note = $state("");
   tags = $state<{ at: string }[]>([]);
 
   // live transcript
-  transcriptCollapsed = $state(true);
-  liveFinal = $state("");
-  liveInterim = $state("");
+  transcriptCollapsed = $state(false);
+  translationTarget = $state("zh-CN");
+  captions = $state<Caption[]>([]);
+  captionError = $state("");
+  finishing = $state(false);
   liveBackendText = $state("");
   liveUpdating = $state(false);
-  whisperMissing = $state(false);
 
   // review & save step
   // reviewBytes/reviewPath are NOT $state: megabytes of audio must never be
   // wrapped in a deep reactive proxy (it makes IPC serialization crawl).
   reviewBytes: Uint8Array = new Uint8Array(0);
   reviewPath = "";      // native (iOS) recordings stay a backend file — no bytes over IPC
+  private reviewSavedSourceId = "";
   reviewExt = "webm";
   reviewName = $state("");
   reviewSubjectId = $state("");
@@ -112,6 +116,7 @@ class RecorderStore {
   reviewDiarize = $state(true);
   reviewDuration = $state("00:00");
   reviewTranscript = $state("");
+  reviewUsesLiveTranscript = $state(false);
   reviewSourceLabel = $state("");
 
   // waveform inputs: web engine exposes the analyser; native exposes a 0-1 level
@@ -129,58 +134,92 @@ class RecorderStore {
   private captureMode: "media" | "wav" = "media";
   private wavProc: ScriptProcessorNode | null = null;
   private wavChunks: Int16Array[] = [];
-  private wavSegStart = 0;
   private watchdog: ReturnType<typeof setTimeout> | null = null;
   private timer: ReturnType<typeof setInterval> | null = null;
   private meterPollActive = false;
-  private recognition: any = null;
-  private recognitionWantsRun = false;
-  private segRecorder: MediaRecorder | null = null;
-  private segChunks: Blob[] = [];
-  private segTimer: ReturnType<typeof setTimeout> | null = null;
-  // Consecutive empty partial-transcription results. One empty answer is NOT
-  // proof that no Whisper is installed — with vad_filter on the server, a quiet
-  // opening segment legitimately comes back empty — so only give up (and show
-  // the "needs Whisper" note) after several empties in a row with no text ever.
-  private emptyStreak = 0;
-  private static readonly EMPTY_STREAK_LIMIT = 3;
+  liveAsrProvider = $state("whisper");
+  private vibevoiceUrl = "http://127.0.0.1:7870";
+  private vibevoiceToken = "";
+  private captionSession: LiveCaptions | VoxtralCaptions | null = null;
+  private captionTimer: ReturnType<typeof setInterval> | null = null;
+  private captionCapture: CaptionAudioCapture | null = null;
+  private captionPcm: Int16Array[] = [];
+  private captionSamples = 0;
+  private captionCapturedSamples = 0;
+  private captionGeneration = 0;
+  private captionHealthTimer: ReturnType<typeof setInterval> | null = null;
+  private nativeCaptionCursor = 0;
+  private captionStart = 0;
+  private liveTranscriptComplete = false;
+  private starting = false;
 
   // ---- derived helpers ----
   get mm(): string { return String(Math.floor(this.secs / 60)).padStart(2, "0"); }
   get ss(): string { return String(this.secs % 60).padStart(2, "0"); }
   get live(): boolean { return this.recording && !this.paused; }
   get liveTranscriptOn(): boolean { return !this.transcriptCollapsed; }
-  get hasLiveTranscript(): boolean {
-    return liveTranscriptSupported && (this.liveFinal.trim().length > 0 || this.liveInterim.trim().length > 0);
-  }
+
 
   // ════════════════════════════ lifecycle ════════════════════════════
 
   async start(): Promise<void> {
     // No new take while one is live OR while the previous one is still being
     // saved/transcribed — a fresh session would trample the in-flight state.
-    if (this.recording || this.status === "transcribing") return;
+    if (this.starting || this.finishing || this.recording || this.status === "transcribing") return;
     if (!app.activeSubject) {
       app.pushToast({ kind: "error", title: "Open a subject first", body: "Select a subject before recording." });
       return;
     }
     this.errorMsg = null;
-    if (isIOS) return this.startNative();
-    return this.startWeb();
+    this.canOpenMicrophoneSettings = false;
+    this.canOpenSystemAudioSettings = false;
+    this.starting = true;
+    try {
+    const settings = await api.getAllSettings();
+    this.liveAsrProvider = normalizeLiveAsrProvider(settings.live_asr_provider);
+    this.vibevoiceUrl = settings.vibevoice_url || "http://127.0.0.1:7870";
+    this.vibevoiceToken = settings.vibevoice_token || "";
+    if (this.liveAsrProvider === "voxtral" && settings.offline_mode === "true" &&
+        !["127.0.0.1", "localhost", "[::1]"].includes(new URL(this.vibevoiceUrl).hostname)) {
+      this.errorMsg = "Offline mode only allows a local Voxtral server";
+      return;
+    }
+    if (isIOS) return await this.startNative(true, false);
+    const [recordMicrophone, recordSystemAudio, runtimePlatform] = await Promise.all([
+      api.getSetting("record_microphone").catch(() => null),
+      api.getSetting("record_system_audio").catch(() => null),
+      api.runtimePlatform().catch(() => (isMacOS ? "macos" : "unknown")),
+    ]);
+    const inputs = recordingInputs(recordMicrophone, recordSystemAudio, runtimePlatform === "macos");
+    if (!hasRecordingInput(inputs)) {
+      this.errorMsg = "Select at least one recording input in Settings → Audio.";
+      return;
+    }
+    if (inputs.systemAudio) return await this.startNative(inputs.microphone, inputs.systemAudio);
+    return await this.startWeb();
+    } catch (error) { this.errorMsg = String(error); }
+    finally { this.starting = false; }
   }
 
-  /** Native iOS capture via AVAudioRecorder (see src-tauri recorder commands). */
-  private async startNative(): Promise<void> {
+  /** Native iOS mic capture or macOS system-audio capture with an optional microphone. */
+  private async startNative(includeMicrophone: boolean, includeSystemAudio: boolean): Promise<void> {
     try {
-      await api.nativeRecStart();
+      await api.nativeRecStart(includeMicrophone, includeSystemAudio);
     } catch (e) {
-      this.errorMsg = "Couldn't start the microphone: " + String(e);
+      this.errorMsg = includeMicrophone && includeSystemAudio
+        ? "Couldn't start microphone and system audio: " + String(e)
+        : includeSystemAudio
+          ? "Couldn't start system audio: " + String(e)
+          : "Couldn't start the microphone: " + String(e);
+      this.canOpenMicrophoneSettings = includeMicrophone;
+      this.canOpenSystemAudioSettings = includeSystemAudio;
       return;
     }
     this.native = true;
     this.beginSession();
     this.meterPollActive = true;
     void this.pollNativeMeter();
+    if (!isMobile && this.liveTranscriptOn) void this.startCaptions();
   }
 
   /**
@@ -213,7 +252,9 @@ class RecorderStore {
     try {
       this.stream = await navigator.mediaDevices.getUserMedia({ audio: true });
     } catch (e) {
-      this.errorMsg = "Microphone access was denied or unavailable: " + String(e);
+      const failure = describeMicrophoneFailure(e, isMacOS);
+      this.errorMsg = failure.message;
+      this.canOpenMicrophoneSettings = failure.canOpenSettings;
       return;
     }
     this.native = false;
@@ -224,6 +265,12 @@ class RecorderStore {
     analyser.fftSize = 256;
     this.srcNode.connect(analyser);
     this.analyser = analyser;
+
+    let captionCaptureError = "";
+    if (!isMobile && this.liveTranscriptOn) {
+      try { await prepareCaptionAudioCapture(this.audioCtx); }
+      catch (error) { captionCaptureError = `Couldn't start reliable live audio capture: ${String(error)}`; }
+    }
 
     this.chunks = [];
     this.wavChunks = [];
@@ -242,6 +289,10 @@ class RecorderStore {
       this.mediaRecorder = null;
     }
     this.beginSession();
+    if (captionCaptureError) {
+      this.liveTranscriptComplete = false;
+      this.captionError = captionCaptureError;
+    }
     // Watchdog: if MediaRecorder is silently broken (WebKitGTK), no chunk will
     // have arrived a few seconds in — swap engines without losing the session.
     if (this.mediaRecorder) {
@@ -251,12 +302,7 @@ class RecorderStore {
     } else {
       this.switchToWavCapture();
     }
-    // Live transcript alongside the recording when the panel is open (desktop
-    // only — mobile transcribes the saved audio on stop).
-    if (this.liveTranscriptOn && !isMobile) {
-      this.startRecognition();
-      this.startBackendPoll();
-    }
+    if (!isMobile && this.liveTranscriptOn && !captionCaptureError) void this.startCaptions();
   }
 
   /** Shared session bootstrap once an engine is capturing. */
@@ -266,39 +312,27 @@ class RecorderStore {
     this.status = "recording";
     this.secs = 0;
     this.tags = [];
-    this.liveFinal = "";
-    this.liveInterim = "";
+    this.captions = [];
+    this.captionError = "";
     this.liveBackendText = "";
-    this.whisperMissing = false;
+    this.liveTranscriptComplete = !isMobile && this.liveTranscriptOn;
     if (this.timer) clearInterval(this.timer);
     this.timer = setInterval(() => { if (this.live) this.secs += 1; }, 1000);
   }
 
-  togglePause(): void {
-    if (!this.recording) return;
-    if (this.native) {
-      if (this.paused) { api.nativeRecResume().catch(() => {}); this.paused = false; }
-      else { api.nativeRecPause().catch(() => {}); this.paused = true; }
-      return;
-    }
-    if (!this.mediaRecorder && this.captureMode !== "wav") return;
-    if (this.paused) {
-      // WAV engine gates on `paused` inside onaudioprocess — nothing to resume.
-      if (this.captureMode === "media") this.mediaRecorder!.resume();
-      this.paused = false;
-      if (this.liveTranscriptOn) {
-        if (SR) this.startRecognition();
-        else this.startSegment();
+  async togglePause(): Promise<void> {
+    if (!this.recording || this.finishing) return;
+    try {
+      if (this.native) {
+        if (this.paused) await api.nativeRecResume();
+        else await api.nativeRecPause();
+      } else if (this.captureMode === "media") {
+        if (this.paused) this.mediaRecorder?.resume();
+        else this.mediaRecorder?.pause();
       }
-    } else {
-      if (this.captureMode === "media") this.mediaRecorder!.pause();
-      this.paused = true;
-      // keep accumulated final text, just halt the live engine(s) while paused
-      this.recognitionWantsRun = false;
-      if (this.recognition) { try { this.recognition.onend = null; this.recognition.stop(); } catch { /* noop */ } this.recognition = null; }
-      this.stopBackendPoll();
-      this.liveInterim = "";
-    }
+      this.paused = !this.paused;
+      if (this.paused) void this.captionSession?.poll();
+    } catch (error) { this.errorMsg = String(error); }
   }
 
   tagMoment(): void {
@@ -306,7 +340,7 @@ class RecorderStore {
   }
 
   stop(): void {
-    if (!this.recording) return;
+    if (!this.recording || this.finishing) return;
     if (this.native) { void this.finalizeNative(); return; }
     if (this.captureMode === "wav") { void this.finalizeWeb(); return; }
     if (!this.mediaRecorder) return;
@@ -315,6 +349,8 @@ class RecorderStore {
 
   /** Abort the in-flight recording and throw the audio away. */
   discardRecording(): void {
+    if (this.finishing) return;
+    this.stopCaptions();
     if (this.native) {
       api.nativeRecCancel().catch(() => {});
     } else if (this.mediaRecorder && this.recording) {
@@ -329,7 +365,7 @@ class RecorderStore {
     this.secs = 0;
     this.tags = [];
     this.status = "ready";
-    this.liveFinal = ""; this.liveInterim = ""; this.liveBackendText = ""; this.whisperMissing = false;
+    this.liveBackendText = ""; this.captions = []; this.captionError = "";
   }
 
   private endTimers(): void {
@@ -339,8 +375,7 @@ class RecorderStore {
   }
 
   private cleanupStream(): void {
-    this.stopRecognition();
-    this.stopBackendPoll();
+    this.detachCaptionCapture();
     if (this.watchdog) { clearTimeout(this.watchdog); this.watchdog = null; }
     if (this.wavProc) { try { this.wavProc.disconnect(); } catch { /* noop */ } this.wavProc = null; }
     this.stream?.getTracks().forEach((t) => t.stop());
@@ -353,10 +388,16 @@ class RecorderStore {
   }
 
   private async finalizeNative(): Promise<void> {
+    this.finishing = true;
+    try {
+      await api.nativeRecPause();
+      this.paused = true;
+      await this.finishCaptions();
+    } catch (error) { this.captionError = String(error); this.stopCaptions(); }
     this.recording = false;
     this.paused = false;
     this.endTimers();
-    let res: { path: string; secs: number };
+    let res: { path: string; secs: number; ext: string };
     try {
       res = await api.nativeRecStop();
     } catch (e) {
@@ -364,10 +405,12 @@ class RecorderStore {
       this.errorMsg = "Couldn't finish the recording: " + String(e);
       this.status = "ready";
       return;
+    } finally {
+      this.finishing = false;
     }
     if (!res.path) {
       this.native = false;
-      this.errorMsg = "Nothing was captured — the microphone produced no audio.";
+      this.errorMsg = "Nothing was captured — the selected recording inputs produced no audio.";
       this.status = "ready";
       return;
     }
@@ -385,15 +428,22 @@ class RecorderStore {
     }
     this.reviewBytes = new Uint8Array(0);
     this.reviewPath = res.path;
-    this.reviewExt = "m4a";
-    this.enterReview(`Lecture ${this.stamp()}`, dur, "captured", "");
+    this.reviewExt = res.ext || "m4a";
+    const transcript = this.liveTranscriptComplete && !this.captionError
+      ? this.formattedLiveTranscript()
+      : "";
+    this.enterReview(`Lecture ${this.stamp()}`, dur, "captured", transcript, !!transcript);
   }
 
   private async finalizeWeb(): Promise<void> {
+    if (this.finishing) return;
+    this.finishing = true;
+    await this.finishCaptions();
     this.recording = false;
     this.paused = false;
     this.cleanupStream();
     this.endTimers();
+    try {
     if (!app.activeSubject) { this.status = "ready"; return; }
 
     let bytes: Uint8Array;
@@ -410,11 +460,14 @@ class RecorderStore {
       this.status = "ready";
       return;
     }
-    // Whatever the live transcript captured (SpeechRecognition or backend fallback).
-    const transcript = (this.liveFinal.trim() || this.liveBackendText.trim());
+    const transcript = this.liveTranscriptComplete && !this.captionError
+      ? this.formattedLiveTranscript()
+      : "";
     this.reviewBytes = bytes;
     this.reviewPath = "";
-    this.enterReview(`Lecture ${this.stamp()}`, `${this.mm}:${this.ss}`, "captured", transcript);
+    this.enterReview(`Lecture ${this.stamp()}`, `${this.mm}:${this.ss}`, "captured", transcript, !!transcript);
+    } catch (error) { this.errorMsg = String(error); this.status = "ready"; }
+    finally { this.finishing = false; }
   }
 
   private stamp(): string {
@@ -427,13 +480,14 @@ class RecorderStore {
   // ════════════════════════════ review & save ════════════════════════════
 
   /** Move into the review step (used by both engines and file uploads). */
-  enterReview(name: string, duration: string, sourceLabel: string, transcript = ""): void {
+  enterReview(name: string, duration: string, sourceLabel: string, transcript = "", usesLiveTranscript = false): void {
     const subj = app.activeSubject;
     if (!subj) { this.status = "ready"; return; }
     this.reviewName = name;
     this.reviewDuration = duration;
     this.reviewSourceLabel = sourceLabel;
     this.reviewTranscript = transcript;
+    this.reviewUsesLiveTranscript = usesLiveTranscript;
     // Default home: the active subject (changeable on the save screen) and its
     // first topic when it has any, otherwise "no topic".
     this.reviewSubjectId = subj.id;
@@ -460,6 +514,7 @@ class RecorderStore {
   }
 
   async confirmSave(): Promise<void> {
+    if (this.status === "transcribing") return;
     const subjId = this.reviewSubjectId || app.activeSubject?.id;
     if (!subjId) { this.status = "ready"; return; }
     const name = this.reviewName.trim() || "Untitled recording";
@@ -473,9 +528,12 @@ class RecorderStore {
     this.status = "transcribing";
     this.errorMsg = null;
     try {
-      this.reviewPath
-        ? await api.saveRecordingPath(subjId, name, this.reviewPath, topicId, this.reviewDiarize)
-        : await api.saveRecordingRaw(subjId, name, this.reviewBytes, topicId, this.reviewExt, this.reviewDiarize);
+      const liveTranscript = this.reviewUsesLiveTranscript ? this.reviewTranscript : undefined;
+      if (this.reviewSavedSourceId) {
+        await api.commitLiveTranscript(this.reviewSavedSourceId, this.reviewTranscript);
+      } else this.reviewPath
+        ? await api.saveRecordingPath(subjId, name, this.reviewPath, topicId, this.reviewDiarize, liveTranscript)
+        : await api.saveRecordingRaw(subjId, name, this.reviewBytes, topicId, this.reviewExt, this.reviewDiarize, liveTranscript);
       // The take is committed (and the native temp file consumed) — clear the
       // review state NOW so a failure in any post-save step can't bounce the
       // user back to a review whose audio no longer exists.
@@ -487,7 +545,9 @@ class RecorderStore {
       app.pushToast({
         kind: "success",
         title: "Recording saved",
-        body: `${capturedLabel} · transcribing in the background — you'll get a notification when it's ready.`,
+        body: this.reviewUsesLiveTranscript
+          ? `${capturedLabel} · indexing the realtime transcript; the original audio is retained.`
+          : `${capturedLabel} · transcribing with Whisper in the background — you'll get a notification when it's ready.`,
       });
       // Reset to a clean slate — reopening the Recorder should read READY, not
       // the finished take's leftover clock and tags.
@@ -497,12 +557,15 @@ class RecorderStore {
       app.openSubject(subjId);
       app.setTab("sources");
     } catch (e) {
+      if (e instanceof api.TranscriptSaveError) this.reviewSavedSourceId = e.sourceId;
       this.errorMsg = String(e);
       this.status = "review"; // back to review so the user can retry without losing the audio
     }
   }
 
   discardReview(): void {
+    this.reviewSavedSourceId = "";
+    this.stopCaptions();
     if (this.reviewPath) api.nativeRecDiscardFile(this.reviewPath).catch(() => {});
     this.reviewBytes = new Uint8Array(0);
     this.reviewPath = "";
@@ -510,178 +573,160 @@ class RecorderStore {
     this.reviewSubjectId = "";
     this.reviewTopicId = "";
     this.reviewTranscript = "";
+    this.reviewUsesLiveTranscript = false;
     this.reviewDuration = "00:00";
     this.secs = 0;
     this.tags = [];
-    this.liveFinal = ""; this.liveInterim = ""; this.liveBackendText = ""; this.whisperMissing = false;
+    this.liveBackendText = ""; this.captions = []; this.captionError = "";
     this.native = false;
     this.status = "ready";
   }
 
-  // ════════════════════ live transcription (web engine) ════════════════════
+  // ════════════════════ live bilingual captions ════════════════════
 
-  /** Open/close the transcript panel; the live engines follow the panel state. */
   toggleTranscriptPanel(): void {
+    if (this.finishing) return;
     this.transcriptCollapsed = !this.transcriptCollapsed;
-    if (!this.recording || this.native) return;
-    if (!this.transcriptCollapsed) {
-      if (!this.paused) this.startRecognition();
-      this.startBackendPoll();
-    } else {
-      this.stopRecognition();
-      this.stopBackendPoll();
-    }
+    if (!this.recording || isMobile) return;
+    this.liveTranscriptComplete = false;
+    if (this.transcriptCollapsed) this.stopCaptions();
+    else void this.startCaptions();
   }
 
-  private startRecognition(): void {
-    if (!SR) return; // platform (e.g. WebKitGTK / Tauri Linux) has no SpeechRecognition
+  private async startCaptions(): Promise<void> {
+    this.stopCaptions();
+    const generation = this.captionGeneration;
+    this.captionError = "";
+    this.captionStart = this.secs;
+    this.captionCapturedSamples = 0;
+    // Opening mid-recording starts at the current capture position.
+    this.nativeCaptionCursor = Math.floor(this.secs * 16000);
+    const target = this.translationTarget;
+    const streaming = this.liveAsrProvider === "voxtral";
+    const readAudio = async () => {
+        const at = this.captionStart;
+        if (this.native) {
+          const chunk = await api.nativeRecChunk(this.nativeCaptionCursor, streaming);
+          this.nativeCaptionCursor = chunk.cursor;
+          this.captionStart = chunk.cursor / 16000;
+          return chunk.audio.length ? { audio: chunk.audio, at } : null;
+        }
+        const pcm = this.captionPcm;
+        this.captionPcm = [];
+        this.captionSamples = 0;
+        this.captionStart = this.secs;
+        if (!pcm.length || (!streaming && meanAmplitude(pcm) < SILENCE_RMS)) return null;
+        return { audio: Array.from(encodeWav(pcm)), at };
+      };
+    const publish = (caption: Caption) => {
+        const index = this.captions.findIndex((item) => item.id === caption.id);
+        if (index === -1) this.captions = [...this.captions, { ...caption }];
+        else this.captions = this.captions.map((item, i) => i === index ? { ...caption } : item);
+        this.liveBackendText = this.captions.map((item) => item.original).join(" ");
+      };
+    const translate = (text: string, draft = false, context = "") => api.translateCaption(text, target, draft, context);
+    const onError = (error: string) => {
+      this.liveTranscriptComplete = false;
+      this.captionError = error;
+      this.stopCaptions();
+    };
+    let session: LiveCaptions | VoxtralCaptions;
     try {
-      this.recognition = new SR();
-      this.recognition.continuous = true;
-      this.recognition.interimResults = true;
-      this.recognition.lang = navigator.language || "en-US";
-      this.recognition.onresult = (ev: any) => {
-        let interim = "";
-        let finalAdd = "";
-        for (let i = ev.resultIndex; i < ev.results.length; i++) {
-          const r = ev.results[i];
-          if (r.isFinal) finalAdd += r[0].transcript;
-          else interim += r[0].transcript;
+      session = streaming
+        ? new VoxtralCaptions(this.vibevoiceUrl, this.vibevoiceToken, readAudio, translate, publish, onError, this.secs)
+        : new LiveCaptions(readAudio, (audio) => api.transcribePartial(audio, "wav"), (text) => translate(text), publish, onError);
+    } catch (error) { onError(String(error)); return; }
+    this.captionSession = session;
+    if (!this.native && this.audioCtx && this.srcNode) {
+      try {
+        const capture = await startCaptionAudioCapture(this.audioCtx, this.srcNode, (pcm) => {
+          if (!this.live || !this.liveTranscriptOn) return;
+          if (this.captionSamples + pcm.length > 16000 * 120) {
+            this.captionError = "Live captions are more than two minutes behind. Close and reopen captions to resume; the full recording is retained.";
+            this.stopCaptions();
+            return;
+          }
+          this.captionPcm.push(pcm);
+          this.captionSamples += pcm.length;
+          this.captionCapturedSamples += pcm.length;
+        });
+        if (generation !== this.captionGeneration || this.captionSession !== session) {
+          capture.close();
+          return;
         }
-        if (finalAdd) this.liveFinal = (this.liveFinal + finalAdd).replace(/\s+/g, " ").trimStart();
-        this.liveInterim = interim;
-      };
-      // Recognition engines auto-stop periodically; restart while we still want it.
-      this.recognition.onend = () => {
-        if (this.recognitionWantsRun && !this.paused) {
-          try { this.recognition.start(); } catch { /* already running */ }
-        }
-      };
-      this.recognition.onerror = () => { /* swallow; backend Whisper remains authoritative */ };
-      this.recognitionWantsRun = true;
-      this.recognition.start();
-    } catch {
-      this.recognition = null;
-      this.recognitionWantsRun = false;
+        this.captionCapture = capture;
+      } catch (error) {
+        onError(`Couldn't start reliable live audio capture: ${String(error)}`);
+        return;
+      }
     }
+    this.captionTimer = setInterval(() => {
+      if (!this.live) return;
+      this.liveUpdating = true;
+      void session.poll().finally(() => {
+        if (this.captionSession === session) this.liveUpdating = false;
+      });
+    }, streaming ? 250 : SEG_MS);
+    this.captionHealthTimer = setInterval(() => {
+      const transport = session instanceof VoxtralCaptions ? session.diagnostics() : null;
+      console.info("[live-captions] health", {
+        capture: this.native ? "native" : "audio-worklet",
+        capturedAudioSeconds: Math.round((this.captionCapturedSamples / 16000) * 10) / 10,
+        queuedAudioSeconds: Math.round((this.captionSamples / 16000) * 10) / 10,
+        ...transport,
+      });
+    }, 10000);
   }
 
-  private stopRecognition(): void {
-    this.recognitionWantsRun = false;
-    if (this.recognition) {
-      try { this.recognition.onend = null; this.recognition.stop(); } catch { /* noop */ }
-      this.recognition = null;
-    }
-    this.liveInterim = "";
+  private detachCaptionCapture(): void {
+    this.captionCapture?.close();
+    this.captionCapture = null;
   }
 
-  private startBackendPoll(): void {
-    if (SR) return; // SpeechRecognition path is authoritative where available
-    this.stopBackendPoll();
-    this.whisperMissing = false;
-    this.emptyStreak = 0;
-    this.startSegment();
-  }
-
-  /** Fold one partial-transcription answer into the live text / whisper state. */
-  private recordPartialResult(text: string): void {
-    if (text && text.trim()) {
-      this.liveBackendText = (this.liveBackendText ? this.liveBackendText + " " : "") + text.trim();
-      this.whisperMissing = false;
-      this.emptyStreak = 0;
-      return;
-    }
-    if (this.liveBackendText) return; // already transcribing fine — just a quiet stretch
-    this.emptyStreak += 1;
-    if (this.emptyStreak >= RecorderStore.EMPTY_STREAK_LIMIT) {
-      // Several empties in a row and never any text → no Whisper answering. Be honest, stop.
-      this.whisperMissing = true;
-      this.stopBackendPoll();
-    }
-  }
-
-  private stopBackendPoll(): void {
-    if (this.segTimer) { clearTimeout(this.segTimer); this.segTimer = null; }
-    if (this.segRecorder) {
-      try { this.segRecorder.onstop = null; this.segRecorder.stop(); } catch { /* noop */ }
-      this.segRecorder = null;
-    }
-    this.segChunks = [];
+  private stopCaptions(): void {
+    this.captionGeneration++;
+    if (this.captionTimer) clearInterval(this.captionTimer);
+    this.captionTimer = null;
+    if (this.captionHealthTimer) clearInterval(this.captionHealthTimer);
+    this.captionHealthTimer = null;
+    this.captionSession?.cancel();
+    this.captionSession = null;
+    this.detachCaptionCapture();
+    this.captionPcm = [];
+    this.captionSamples = 0;
     this.liveUpdating = false;
   }
 
-  // Record one ~7s segment on the shared stream; onstop transcribes + appends it.
-  private startSegment(): void {
-    if (SR || !this.stream || !this.recording || this.paused || !this.liveTranscriptOn) return;
-    if (this.captureMode === "wav") {
-      // PCM engine: a segment is just a slice of wavChunks. Anchor the start here
-      // and cut at the timer; transcribeWavSegment re-anchors only when it
-      // actually consumes the slice, so a slow round-trip just grows the window.
-      this.wavSegStart = this.wavChunks.length;
-      this.segTimer = setTimeout(() => void this.transcribeWavSegment(), SEG_MS);
-      return;
-    }
+  private async finishCaptions(): Promise<void> {
+    if (this.captionTimer) clearInterval(this.captionTimer);
+    this.captionTimer = null;
+    if (this.captionHealthTimer) clearInterval(this.captionHealthTimer);
+    this.captionHealthTimer = null;
+    this.liveUpdating = true;
+    const session = this.captionSession;
     try {
-      this.segChunks = [];
-      this.segRecorder = new MediaRecorder(this.stream);
-      this.segRecorder.ondataavailable = (e) => { if (e.data.size > 0) this.segChunks.push(e.data); };
-      this.segRecorder.onstop = () => void this.transcribeSegment();
-      this.segRecorder.start();
-      this.segTimer = setTimeout(() => { try { this.segRecorder?.stop(); } catch { /* noop */ } }, SEG_MS);
-    } catch {
-      this.segRecorder = null;
+      await this.captionCapture?.flush();
+      this.detachCaptionCapture();
+      await session?.finish();
     }
+    catch (error) { this.captionError = String(error); }
+    finally { this.stopCaptions(); }
   }
 
-  private async transcribeWavSegment(): Promise<void> {
-    // ADAPTIVE GUARD: if the previous segment is still transcribing, don't queue
-    // a second request — leave wavSegStart where it is so the pending slice grows
-    // to cover this window, and re-check after another cadence tick.
-    if (this.liveUpdating) {
-      this.segTimer = setTimeout(() => void this.transcribeWavSegment(), SEG_MS);
-      return;
-    }
-    const seg = this.wavChunks.slice(this.wavSegStart);
-    // We're consuming this slice now: advance the anchor and re-arm the loop so
-    // the next window starts from here (back-to-back, no overlap, no gap loss —
-    // the saved transcript comes from the continuous WAV, re-transcribed on save).
-    this.wavSegStart = this.wavChunks.length;
-    this.segTimer = setTimeout(() => void this.transcribeWavSegment(), SEG_MS);
-    if (seg.length === 0) return;
-    // Silence gate: skip near-silent windows (pauses) — no whisper call, no UI
-    // change. Saves cycles and avoids whisper hallucinating words from room tone.
-    if (meanAmplitude(seg) < SILENCE_RMS) return;
-    this.liveUpdating = true;
-    try {
-      const text = await api.transcribePartial(Array.from(encodeWav(seg)), "wav");
-      this.recordPartialResult(text);
-    } catch {
-      // Backend hiccup — keep what we have; the next segment will continue.
-    } finally {
-      this.liveUpdating = false;
-    }
+  private formattedLiveTranscript(): string {
+    return formatBilingualTranscript(this.captions, this.translationTarget);
   }
 
-  private async transcribeSegment(): Promise<void> {
-    const localChunks = this.segChunks;
-    this.segChunks = [];
-    // Kick off the next segment immediately so we keep capturing while this one
-    // transcribes (any tiny gap only affects the live PREVIEW — the saved audio is
-    // the continuous recorder, re-transcribed precisely on save).
-    this.startSegment();
-    if (localChunks.length === 0) return;
-    // ADAPTIVE GUARD: never run two transcriptions at once.
-    if (this.liveUpdating) return;
-    this.liveUpdating = true;
+  async exportCaptions(): Promise<void> {
+    const text = this.captions.map((item) => {
+      const at = `${Math.floor(item.at / 60).toString().padStart(2, "0")}:${Math.floor(item.at % 60).toString().padStart(2, "0")}`;
+      return `[${at}]${item.speaker ? ` ${item.speaker}` : ""}\n${item.original}\n${item.translated}`;
+    }).join("\n\n");
     try {
-      const blob = new Blob(localChunks, { type: localChunks[0]?.type || "audio/webm" });
-      const bytes = Array.from(new Uint8Array(await blob.arrayBuffer()));
-      const text = await api.transcribePartial(bytes);
-      this.recordPartialResult(text);
-    } catch {
-      // Backend hiccup — keep what we have; the next segment will continue.
-    } finally {
-      this.liveUpdating = false;
+      await navigator.clipboard.writeText(text);
+      app.pushToast({ kind: "success", title: "Bilingual captions copied" });
+    } catch (error) {
+      app.pushToast({ kind: "error", title: "Couldn't copy captions", body: String(error) });
     }
   }
 
@@ -703,7 +748,6 @@ class RecorderStore {
     this.mediaRecorder = null;
     this.captureMode = "wav";
     this.wavChunks = [];
-    this.wavSegStart = 0;
     this.wavProc = this.audioCtx.createScriptProcessor(4096, 1, 1);
     this.srcNode.connect(this.wavProc);
     // The processor only runs while routed to the destination — mute it.
@@ -715,11 +759,6 @@ class RecorderStore {
       if (!this.recording || this.paused) return;
       this.wavChunks.push(downsampleTo16k(e.inputBuffer.getChannelData(0), rate));
     };
-    // Restart the live-transcript segment loop on the new engine.
-    if (this.liveTranscriptOn && !SR) {
-      this.stopBackendPoll();
-      this.startBackendPoll();
-    }
   }
 }
 

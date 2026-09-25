@@ -43,12 +43,11 @@ const REMOTE_STAMP: &str = "cortex.stamp";
 
 // ---- credential encryption (sync at rest) ----------------------------------
 //
-// Sync uploads the whole SQLite DB to the homelab WebDAV, so any secret in the
-// `settings` table would otherwise sit there in plaintext. Before upload we encrypt
-// every credential value (API keys, Google/Moodle tokens, custom endpoint) with
-// XChaCha20-Poly1305 under a key derived from the SYNC PASSWORD — which both linked
-// devices have but the WebDAV (and anyone reading the snapshot off disk) does not. The
-// result is opaque (unreadable) and AEAD-authenticated (tamper-evident) outside the app.
+// Before upload, remove device-local settings (including the sync password and
+// provider API keys). Encrypt the allowlisted Google/Moodle credentials using
+// XChaCha20-Poly1305 under a key derived from the sync password. A snapshot alone
+// must not contain that password or plaintext credentials. This is protection
+// at rest, not protection from a server/operator that already knows the password.
 // Values carry an `enc:v1:` marker; anything without it is plaintext (back-compat with
 // pre-encryption snapshots and non-secret preferences).
 use base64::Engine as _;
@@ -112,31 +111,41 @@ fn unseal_cred(stored: &str, pass: &str) -> Option<String> {
         return None;
     }
     let (nonce, ct) = blob.split_at(24);
-    let pt = cred_cipher(pass).decrypt(XNonce::from_slice(nonce), ct).ok()?;
+    let pt = cred_cipher(pass)
+        .decrypt(XNonce::from_slice(nonce), ct)
+        .ok()?;
     String::from_utf8(pt).ok()
 }
 
-/// Encrypt (or, with no sync password, blank) every credential value in a snapshot DB
-/// copy about to be uploaded. Operates on the TEMP COPY only — the live DB keeps its
-/// plaintext values so the running app is unaffected.
+/// Remove non-syncable settings, then encrypt (or without a password, blank) the
+/// remaining credentials. Operates only on the TEMP COPY, never the live DB.
 pub(crate) fn seal_snapshot_credentials(snapshot: &Path, pass: &str) -> Result<()> {
     let conn = Connection::open(snapshot)?;
+    conn.execute_batch("PRAGMA secure_delete=ON;")?;
     let rows: Vec<(String, String)> = {
         let mut st = conn.prepare("SELECT key, value FROM settings")?;
         let r = st.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
-        r.filter_map(|x| x.ok()).collect()
+        r.collect::<rusqlite::Result<_>>()?
     };
+    let tx = conn.unchecked_transaction()?;
     for (k, v) in rows {
+        if !is_syncable_setting(&k) {
+            tx.execute("DELETE FROM settings WHERE key=?1", [&k])?;
+            continue;
+        }
         if !is_credential_key(&k) || v.is_empty() || v.starts_with(ENC_PREFIX) {
             continue;
         }
         // No password ⇒ blank (""), never upload a readable secret.
         let sealed = seal_cred(&v, pass).unwrap_or_default();
-        conn.execute(
+        tx.execute(
             "UPDATE settings SET value=?1 WHERE key=?2",
             rusqlite::params![sealed, k],
         )?;
     }
+    tx.commit()?;
+    // Rebuild pages so removed passwords / old plaintext cannot ride free space.
+    conn.execute_batch("VACUUM; PRAGMA wal_checkpoint(TRUNCATE);")?;
     Ok(())
 }
 
@@ -157,7 +166,11 @@ pub(crate) fn now_ms() -> i64 {
 fn endpoint(c: &Connection, key: &str) -> Option<String> {
     let u = repo::get_setting(c, key).ok().flatten()?;
     let u = u.trim().trim_end_matches('/').to_string();
-    if u.is_empty() { None } else { Some(u) }
+    if u.is_empty() {
+        None
+    } else {
+        Some(u)
+    }
 }
 
 /// Quick reachability probe for an endpoint (short timeout). Reachable when the
@@ -168,7 +181,9 @@ fn reachable(cfg: &SyncCfg) -> bool {
         .timeout(std::time::Duration::from_secs(4))
         .build()
         .unwrap_or_default();
-    auth(quick.get(file_url(cfg, REMOTE_STAMP)), cfg).send().is_ok()
+    auth(quick.get(file_url(cfg, REMOTE_STAMP)), cfg)
+        .send()
+        .is_ok()
 }
 
 /// Read sync config: None when disabled, no URL set, or (in auto mode) no endpoint
@@ -186,14 +201,30 @@ pub fn read_cfg_manual(c: &Connection) -> Option<SyncCfg> {
 }
 
 fn read_cfg_inner(c: &Connection, require_enabled: bool) -> Option<SyncCfg> {
-    if require_enabled
-        && repo::get_setting(c, K_ENABLED).ok().flatten().as_deref() != Some("true")
+    if repo::get_setting(c, "offline_mode")
+        .ok()
+        .flatten()
+        .as_deref()
+        == Some("true")
     {
         return None;
     }
-    let user = repo::get_setting(c, K_USER).ok().flatten().unwrap_or_default();
-    let pass = repo::get_setting(c, K_PASS).ok().flatten().unwrap_or_default();
-    let mode = repo::get_setting(c, K_MODE).ok().flatten().unwrap_or_else(|| "auto".into());
+    if require_enabled && repo::get_setting(c, K_ENABLED).ok().flatten().as_deref() != Some("true")
+    {
+        return None;
+    }
+    let user = repo::get_setting(c, K_USER)
+        .ok()
+        .flatten()
+        .unwrap_or_default();
+    let pass = repo::get_setting(c, K_PASS)
+        .ok()
+        .flatten()
+        .unwrap_or_default();
+    let mode = repo::get_setting(c, K_MODE)
+        .ok()
+        .flatten()
+        .unwrap_or_else(|| "auto".into());
 
     let local = endpoint(c, K_URL);
     let ts = endpoint(c, K_URL_TS);
@@ -223,10 +254,14 @@ fn read_cfg_inner(c: &Connection, require_enabled: bool) -> Option<SyncCfg> {
     // access token is enforced, since /sync is the only token-exempt path). Repoint
     // such URLs at the base's /sync service; genuinely custom WebDAV roots (no match
     // with any homelab base) are left untouched.
-    let bases: Vec<String> = ["homelab_base", "homelab_tailscale_base", "homelab_public_base"]
-        .iter()
-        .filter_map(|k| endpoint(c, k))
-        .collect();
+    let bases: Vec<String> = [
+        "homelab_base",
+        "homelab_tailscale_base",
+        "homelab_public_base",
+    ]
+    .iter()
+    .filter_map(|k| endpoint(c, k))
+    .collect();
     for url in candidates.iter_mut() {
         if bases.contains(url) {
             url.push_str("/sync");
@@ -246,10 +281,18 @@ fn read_cfg_inner(c: &Connection, require_enabled: bool) -> Option<SyncCfg> {
     // A single configured endpoint: use it directly (no probe — let the real
     // request surface any error). Multiple: probe and pick the first reachable.
     if candidates.len() == 1 {
-        return Some(SyncCfg { url: candidates.into_iter().next().unwrap(), user, pass });
+        return Some(SyncCfg {
+            url: candidates.into_iter().next().unwrap(),
+            user,
+            pass,
+        });
     }
     for url in &candidates {
-        let cfg = SyncCfg { url: url.clone(), user: user.clone(), pass: pass.clone() };
+        let cfg = SyncCfg {
+            url: url.clone(),
+            user: user.clone(),
+            pass: pass.clone(),
+        };
         if reachable(&cfg) {
             return Some(cfg);
         }
@@ -268,10 +311,7 @@ fn client() -> reqwest::blocking::Client {
         .unwrap_or_default()
 }
 
-fn auth(
-    rb: reqwest::blocking::RequestBuilder,
-    cfg: &SyncCfg,
-) -> reqwest::blocking::RequestBuilder {
+fn auth(rb: reqwest::blocking::RequestBuilder, cfg: &SyncCfg) -> reqwest::blocking::RequestBuilder {
     if cfg.user.is_empty() {
         rb
     } else {
@@ -399,13 +439,20 @@ fn is_syncable_setting(key: &str) -> bool {
     //
     // Provider API keys remain NOT synced (security): a billable OpenRouter/Claude/OpenAI/
     // Gemini key is a real per-device secret. Each device holds its own; the keys tab
-    // promises "never synced". (They're still encrypted in the snapshot at rest.) The
+    // promises "never synced". They are removed from uploaded snapshots too. The
     // `_key` substring guard below backstops this if a future key sneaks into a group.
     const SYNCED_CREDS: &[&str] = &[
-        "moodle_url", "moodle_token", "moodle_userid",
-        "google_client_id", "google_client_secret", "google_access_token",
-        "google_refresh_token", "google_token_expiry", "google_connected_email",
-        "google_calendar_id", "google_pull_calendars",
+        "moodle_url",
+        "moodle_token",
+        "moodle_userid",
+        "google_client_id",
+        "google_client_secret",
+        "google_access_token",
+        "google_refresh_token",
+        "google_token_expiry",
+        "google_connected_email",
+        "google_calendar_id",
+        "google_pull_calendars",
     ];
     if SYNCED_CREDS.contains(&key) {
         return true;
@@ -416,8 +463,16 @@ fn is_syncable_setting(key: &str) -> bool {
         return false;
     }
     const BLOCK_PREFIX: &[&str] = &[
-        "sync", "moodle", "google", "last_", "homelab", "tailscale", "whisper",
-        "searxng", "ollama", "offline",
+        "sync",
+        "moodle",
+        "google",
+        "last_",
+        "homelab",
+        "tailscale",
+        "whisper",
+        "searxng",
+        "ollama",
+        "offline",
     ];
     if BLOCK_PREFIX.iter().any(|p| key.starts_with(p)) {
         return false;
@@ -430,8 +485,17 @@ fn is_syncable_setting(key: &str) -> bool {
     }
     // Allowlisted standalone preferences.
     const ALLOW_EXACT: &[&str] = &[
-        "theme", "follow_omarchy", "reading_font", "density", "default_station",
-        "autoplay", "web_images_enabled", "exp_moodle", "cs_memory", "station_favs",
+        "theme",
+        "language",
+        "follow_omarchy",
+        "reading_font",
+        "density",
+        "default_station",
+        "autoplay",
+        "web_images_enabled",
+        "exp_moodle",
+        "cs_memory",
+        "station_favs",
         "host_voices",
     ];
     ALLOW_EXACT.contains(&key)
@@ -497,8 +561,7 @@ pub(crate) fn merge_attached(conn: &Connection, remote: &Path) -> Result<()> {
     )?;
 
     let local_tables = user_tables(conn, "main")?;
-    let remote_tables: HashSet<String> =
-        user_tables(conn,"rmt")?.into_iter().collect();
+    let remote_tables: HashSet<String> = user_tables(conn, "rmt")?.into_iter().collect();
 
     for t in &local_tables {
         if !remote_tables.contains(t) {
@@ -506,8 +569,7 @@ pub(crate) fn merge_attached(conn: &Connection, remote: &Path) -> Result<()> {
         }
         // Use only columns present in BOTH schemas, so an older remote (missing
         // a column a later migration added) doesn't blow up the SELECT.
-        let remote_cols: HashSet<String> =
-            columns_of(conn, "rmt", t)?.into_iter().collect();
+        let remote_cols: HashSet<String> = columns_of(conn, "rmt", t)?.into_iter().collect();
         let cols: Vec<String> = columns(conn, t)?
             .into_iter()
             .filter(|c| remote_cols.contains(c))
@@ -557,7 +619,7 @@ pub(crate) fn merge_attached(conn: &Connection, remote: &Path) -> Result<()> {
     // Apply tombstones with FK ON so a parent delete cascades to its children.
     conn.pragma_update(None, "foreign_keys", "ON")?;
     for t in &local_tables {
-        let cols = columns(conn,t)?;
+        let cols = columns(conn, t)?;
         if cols.iter().any(|c| c == "id") && cols.iter().any(|c| c == "updated_at") {
             let sql = format!(
                 "DELETE FROM main.\"{t}\" WHERE id IN \
@@ -577,11 +639,16 @@ pub(crate) fn merge_attached(conn: &Connection, remote: &Path) -> Result<()> {
     if has_table(conn, "rmt", "settings") {
         // The local sync password decrypts the snapshot's credential values.
         let pass: String = conn
-            .query_row("SELECT value FROM main.settings WHERE key='sync_pass'", [], |r| r.get(0))
+            .query_row(
+                "SELECT value FROM main.settings WHERE key='sync_pass'",
+                [],
+                |r| r.get(0),
+            )
             .unwrap_or_default();
         let pairs: Vec<(String, String)> = {
             let mut st = conn.prepare("SELECT key, value FROM rmt.settings")?;
-            let rows = st.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
+            let rows =
+                st.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
             rows.filter_map(|x| x.ok()).collect()
         };
         for (k, v) in pairs {
@@ -590,7 +657,9 @@ pub(crate) fn merge_attached(conn: &Connection, remote: &Path) -> Result<()> {
             }
             // Decrypt `enc:v1:` values (Google/Moodle creds); plaintext prefs pass through.
             // Skip anything we can't decrypt rather than storing ciphertext as a value.
-            let Some(value) = unseal_cred(&v, &pass) else { continue };
+            let Some(value) = unseal_cred(&v, &pass) else {
+                continue;
+            };
             // Never let a blanked credential (e.g. snapshot built with no sync password)
             // overwrite a device's real connected token — that would falsely disconnect it.
             if value.is_empty() && is_credential_key(&k) {
@@ -677,14 +746,14 @@ pub async fn sync_test(url: String, user: String, pass: String) -> Result<bool> 
 /// half of live sync — called debounced from the frontend after changes).
 #[tauri::command]
 pub async fn sync_push(app: AppHandle) -> Result<i64> {
-    tauri::async_runtime::spawn_blocking(move || push_blocking(&app))
+    tauri::async_runtime::spawn_blocking(move || push_blocking(&app, false))
         .await
         .map_err(|e| Error::Other(format!("sync push task failed: {e}")))?
 }
 
 /// Blocking body of `sync_push`, shared with the background sync loop. Uploads a
 /// fresh whole-DB snapshot (credentials sealed) plus the binary vault to the homelab.
-fn push_blocking(app: &AppHandle) -> Result<i64> {
+fn push_blocking(app: &AppHandle, require_enabled: bool) -> Result<i64> {
     let state = app.state::<AppState>();
     let db_path = app
         .path()
@@ -693,20 +762,24 @@ fn push_blocking(app: &AppHandle) -> Result<i64> {
         .join("cortex.db");
     let cfg = {
         let c = state.db.lock().unwrap();
-        read_cfg_manual(&c).ok_or_else(|| {
+        let configured = if require_enabled {
+            read_cfg(&c)
+        } else {
+            read_cfg_manual(&c)
+        };
+        configured.ok_or_else(|| {
             Error::Other(
-                "Sync target not set — add a Homelab URL (or sync URL) in Settings → Integrations.".into(),
+                "Sync target not set — add a Homelab URL (or sync URL) in Settings → Integrations."
+                    .into(),
             )
         })?
     };
-    // Checkpoint the WAL into the main file, then copy a clean snapshot.
+    // SQLite makes a consistent copy, including committed WAL pages.
     let ts = now_ms();
-    let tmp = std::env::temp_dir().join(format!("cortex-sync-{ts}.db"));
+    let tmp = std::env::temp_dir().join(format!("cortex-sync-{}.db", crate::db::new_id()));
     {
         let c = state.db.lock().unwrap();
-        let _: std::result::Result<String, _> =
-            c.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |r| r.get(0));
-        std::fs::copy(&db_path, &tmp).map_err(Error::Io)?;
+        c.execute("VACUUM main INTO ?1", [tmp.to_string_lossy().as_ref()])?;
     }
     // Encrypt every credential value in the snapshot copy before it leaves the
     // device, keyed by the sync password (the live DB keeps plaintext).
@@ -768,6 +841,18 @@ pub fn background_tick(app: &AppHandle) {
     }
     let _guard = BusyGuard;
     if let Some(state) = app.try_state::<AppState>() {
+        {
+            let c = state.db.lock().unwrap();
+            if repo::get_setting(&c, K_ENABLED).ok().flatten().as_deref() != Some("true")
+                || repo::get_setting(&c, "offline_mode")
+                    .ok()
+                    .flatten()
+                    .as_deref()
+                    == Some("true")
+            {
+                return;
+            }
+        }
         // warm() takes a SHORT lock to read config, then releases it before the network
         // probe. NEVER hold the DB mutex across a reachability check: a synchronous
         // command (e.g. get_all_settings) runs on the event-loop thread and would block
@@ -776,16 +861,12 @@ pub fn background_tick(app: &AppHandle) {
         homelab::warm(state.inner());
     }
     let _ = pull_blocking(app);
-    let _ = push_blocking(app);
+    let _ = push_blocking(app, true);
 }
 
 // ---- binary file sync (WebDAV) ---------------------------------------------
 
-fn dav_request(
-    cfg: &SyncCfg,
-    method: &[u8],
-    path: &str,
-) -> reqwest::blocking::RequestBuilder {
+fn dav_request(cfg: &SyncCfg, method: &[u8], path: &str) -> reqwest::blocking::RequestBuilder {
     let m = reqwest::Method::from_bytes(method).unwrap_or(reqwest::Method::GET);
     auth(client().request(m, file_url(cfg, path)), cfg)
 }
@@ -916,11 +997,20 @@ mod tests {
     fn syncable_settings_never_include_credentials() {
         // Provider API keys & device endpoints must NEVER sync across devices.
         for k in [
-            "gemini_api_key", "openrouter_api_key", "openai_api_key", "claude_api_key",
+            "gemini_api_key",
+            "openrouter_api_key",
+            "openai_api_key",
+            "claude_api_key",
             "custom_api_key",
-            "custom_endpoint", "ollama_url", "searxng_url",
-            "whisper_url", "sync_url", "sync_enabled", "google_calendar_token",
-            "last_subject_id", "offline_mode",
+            "custom_endpoint",
+            "ollama_url",
+            "searxng_url",
+            "whisper_url",
+            "sync_url",
+            "sync_enabled",
+            "google_calendar_token",
+            "last_subject_id",
+            "offline_mode",
         ] {
             assert!(!is_syncable_setting(k), "{k} must not sync");
         }
@@ -928,25 +1018,54 @@ mod tests {
         // (opt-in, ride the user's own homelab WebDAV, ENCRYPTED at rest) so a linked
         // phone shows connected and works without repeating sign-in.
         for k in [
-            "moodle_url", "moodle_token", "moodle_userid",
-            "google_refresh_token", "google_access_token", "google_client_id",
-            "google_client_secret", "google_connected_email", "google_pull_calendars",
+            "moodle_url",
+            "moodle_token",
+            "moodle_userid",
+            "google_refresh_token",
+            "google_access_token",
+            "google_client_id",
+            "google_client_secret",
+            "google_connected_email",
+            "google_pull_calendars",
         ] {
-            assert!(is_syncable_setting(k), "{k} should sync (opt-in credential)");
+            assert!(
+                is_syncable_setting(k),
+                "{k} should sync (opt-in credential)"
+            );
         }
         // Every synced credential MUST be classed as a credential so it's encrypted
         // before upload (never plaintext on the WebDAV).
-        for k in ["moodle_token", "google_refresh_token", "google_client_secret"] {
-            assert!(is_credential_key(k), "{k} must be encrypted in the snapshot");
+        for k in [
+            "moodle_token",
+            "google_refresh_token",
+            "google_client_secret",
+        ] {
+            assert!(
+                is_credential_key(k),
+                "{k} must be encrypted in the snapshot"
+            );
         }
         // Preferences SHOULD sync (and are NOT treated as credentials).
         for k in [
-            "theme", "density", "reading_font", "keybind_cmdk", "keybind_preset",
-            "model_chat", "budget_cheatsheet", "pomo_workMin", "profile_name",
-            "default_station", "web_images_enabled", "cs_memory",
+            "theme",
+            "language",
+            "density",
+            "reading_font",
+            "keybind_cmdk",
+            "keybind_preset",
+            "model_chat",
+            "budget_cheatsheet",
+            "pomo_workMin",
+            "profile_name",
+            "default_station",
+            "web_images_enabled",
+            "cs_memory",
         ] {
             assert!(is_syncable_setting(k), "{k} should sync");
-            assert!(!is_credential_key(k), "{k} is a preference, not a credential");
+            assert!(
+                !is_credential_key(k),
+                "{k} is a preference, not a credential"
+            );
         }
     }
 
@@ -956,7 +1075,10 @@ mod tests {
         let secret = "1//refresh-token-abc.DEF_ghi";
         let sealed = seal_cred(secret, pass).expect("seal");
         assert!(sealed.starts_with(ENC_PREFIX), "carries the version marker");
-        assert!(!sealed.contains(secret), "plaintext is not present in the blob");
+        assert!(
+            !sealed.contains(secret),
+            "plaintext is not present in the blob"
+        );
         // Right password → original value back.
         assert_eq!(unseal_cred(&sealed, pass).as_deref(), Some(secret));
         // Wrong password → refuses (returns None, never garbage).
@@ -966,7 +1088,10 @@ mod tests {
         bad.push('A');
         assert_eq!(unseal_cred(&bad, pass), None);
         // Plaintext (a preference, or a pre-encryption snapshot) passes through unchanged.
-        assert_eq!(unseal_cred("osaka-jade", pass).as_deref(), Some("osaka-jade"));
+        assert_eq!(
+            unseal_cred("osaka-jade", pass).as_deref(),
+            Some("osaka-jade")
+        );
         // No password ⇒ we cannot seal (caller blanks instead of leaking).
         assert_eq!(seal_cred(secret, ""), None);
     }
@@ -998,7 +1123,8 @@ mod tests {
             ins(&rc, "remote-only", "bring-me", 100); // must arrive
             ins(&lc, "doomed", "x", 100); // deleted on remote → tombstone wins
             ins(&rc, "doomed", "x", 100);
-            rc.execute("DELETE FROM subjects WHERE id='doomed'", []).unwrap();
+            rc.execute("DELETE FROM subjects WHERE id='doomed'", [])
+                .unwrap();
 
             for c in [&lc, &rc] {
                 let _: std::result::Result<String, _> =
@@ -1010,19 +1136,27 @@ mod tests {
 
         let c = Connection::open(&lp).unwrap();
         let name: String = c
-            .query_row("SELECT name FROM subjects WHERE id='shared'", [], |r| r.get(0))
+            .query_row("SELECT name FROM subjects WHERE id='shared'", [], |r| {
+                r.get(0)
+            })
             .unwrap();
         assert_eq!(name, "new-name", "newer updated_at must win (ISC-11)");
         let count = |id: &str| -> i64 {
-            c.query_row(
-                "SELECT count(*) FROM subjects WHERE id=?1",
-                [id],
-                |r| r.get(0),
-            )
+            c.query_row("SELECT count(*) FROM subjects WHERE id=?1", [id], |r| {
+                r.get(0)
+            })
             .unwrap()
         };
-        assert_eq!(count("local-only"), 1, "local-only row must survive (ISC-12)");
-        assert_eq!(count("remote-only"), 1, "remote-only row must arrive (ISC-10)");
+        assert_eq!(
+            count("local-only"),
+            1,
+            "local-only row must survive (ISC-12)"
+        );
+        assert_eq!(
+            count("remote-only"),
+            1,
+            "remote-only row must arrive (ISC-10)"
+        );
         assert_eq!(count("doomed"), 0, "tombstoned row must be deleted");
 
         drop(c);
@@ -1044,8 +1178,9 @@ mod tests {
             let lc = local.db.lock().unwrap();
             let rc = remote.db.lock().unwrap();
             ins(&rc, "from-laptop", "all-my-data", 100); // remote-only row to pull in
-            // Strip the new bits so `remote` looks like an old-schema DB.
-            rc.execute("DROP TRIGGER IF EXISTS tomb_subjects", []).unwrap();
+                                                         // Strip the new bits so `remote` looks like an old-schema DB.
+            rc.execute("DROP TRIGGER IF EXISTS tomb_subjects", [])
+                .unwrap();
             rc.execute("DROP TABLE IF EXISTS tombstones", []).unwrap();
             for c in [&lc, &rc] {
                 let _: std::result::Result<String, _> =
@@ -1063,7 +1198,10 @@ mod tests {
                 |r| r.get(0),
             )
             .unwrap();
-        assert_eq!(n, 1, "remote-only row must arrive even from an old-schema DB");
+        assert_eq!(
+            n, 1,
+            "remote-only row must arrive even from an old-schema DB"
+        );
         drop(c);
         let _ = fs::remove_dir_all(&dir);
     }
@@ -1094,4 +1232,64 @@ pub fn repoint_source_files(conn: &Connection, sources_dir: &Path) -> Result<()>
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod privacy_regressions {
+    use super::*;
+    use crate::db::AppState;
+
+    #[test]
+    fn uploaded_snapshot_contains_only_syncable_settings_and_no_plaintext_secrets() {
+        let path = std::env::temp_dir().join(format!("sync-secrets-{}.db", crate::db::new_id()));
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch("PRAGMA journal_mode=WAL; CREATE TABLE settings(key TEXT PRIMARY KEY, value TEXT NOT NULL)").unwrap();
+        let pass = "regression-sync-password-never-upload";
+        let token = "regression-google-refresh-token";
+        for (k, v) in [
+            ("sync_pass", pass),
+            ("openai_api_key", "regression-api-key"),
+            ("google_refresh_token", token),
+            ("theme", "dark"),
+        ] {
+            repo::set_setting(&conn, k, v).unwrap();
+        }
+        drop(conn);
+        seal_snapshot_credentials(&path, pass).unwrap();
+        let conn = Connection::open(&path).unwrap();
+        assert!(repo::get_setting(&conn, "sync_pass").unwrap().is_none());
+        assert!(repo::get_setting(&conn, "openai_api_key")
+            .unwrap()
+            .is_none());
+        assert_eq!(
+            repo::get_setting(&conn, "theme").unwrap().as_deref(),
+            Some("dark")
+        );
+        let sealed = repo::get_setting(&conn, "google_refresh_token")
+            .unwrap()
+            .unwrap();
+        assert_eq!(unseal_cred(&sealed, pass).as_deref(), Some(token));
+        drop(conn);
+        let bytes = std::fs::read(&path).unwrap();
+        for secret in [pass, token, "regression-api-key"] {
+            assert!(!bytes.windows(secret.len()).any(|w| w == secret.as_bytes()));
+        }
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn auto_sync_respects_disabled_and_offline_but_manual_can_override_disabled() {
+        let state = AppState::in_memory().unwrap();
+        let c = state.db.lock().unwrap();
+        repo::set_setting(&c, "sync_mode", "local").unwrap();
+        repo::set_setting(&c, "sync_url", "http://127.0.0.1:1/sync").unwrap();
+        repo::set_setting(&c, "sync_enabled", "false").unwrap();
+        assert!(read_cfg(&c).is_none());
+        assert!(read_cfg_manual(&c).is_some());
+        repo::set_setting(&c, "sync_enabled", "true").unwrap();
+        assert!(read_cfg(&c).is_some());
+        repo::set_setting(&c, "offline_mode", "true").unwrap();
+        assert!(read_cfg(&c).is_none());
+        assert!(read_cfg_manual(&c).is_none());
+    }
 }

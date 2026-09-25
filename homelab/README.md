@@ -11,7 +11,7 @@ appends the rest.
 | Service | Reached at | What it gives Cortex |
 |---------|-----------|----------------------|
 | **SearXNG** | `<url>/searxng` | Diagrams/images in cheatsheets + web-enriched chat |
-| **WhisperX** (whisper-asr-webservice) | `<url>/whisper` | Long-form lecture transcription + speaker diarization |
+| **WhisperX** *(optional)* (whisper-asr-webservice) | `<url>/whisper` | Optional long-form refinement + speaker diarization |
 | **Sync** (WebDAV) | `<url>/sync` | Binary vault (source files/recordings) + snapshot fallback |
 | **Live sync** (syncd) | `<url>/syncd` | Instant cross-device sync — delta log + WebSocket push |
 | **Ingest** (Apache Tika) | `<url>/ingest` | Document → text for **mobile** (PDF/DOCX/PPTX/legacy + OCR of scanned pages) — a phone can't run poppler/libreoffice |
@@ -27,8 +27,9 @@ cd homelab
 # (recommended) set a SearXNG secret first:
 sed -i "s/change-me-openssl-rand-hex-32/$(openssl rand -hex 32)/" searxng/settings.yml
 
-docker compose up -d                    # proxy + SearXNG + Whisper + Sync
-docker compose --profile ollama up -d   # also bring up Ollama
+docker compose up -d                    # proxy + SearXNG + Sync (no Whisper)
+docker compose --profile whisper up -d  # optionally add WhisperX
+docker compose --profile ollama up -d   # optionally add Ollama
 ```
 
 Then in Cortex → **Settings → Integrations → Homelab URL**, enter the single
@@ -91,6 +92,9 @@ never crosses the wire in clear.
 
 ## Notes
 
+- **Whisper is opt-in:** it stays stopped in Realtime only mode. Start it with
+  `docker compose --profile whisper up -d` only when you want a second-pass
+  refinement or speaker diarization.
 - **GPU:** swap the Whisper image to `…:latest-gpu` with `WHISPER_DEVICE=cuda`,
   and uncomment the Ollama `deploy.resources` block (needs the NVIDIA container
   toolkit). An hour-long lecture transcribes in a couple of minutes on GPU.
@@ -136,7 +140,8 @@ scp -r homelab/ <host>:~/cortex-homelab && ssh <host>
 cd ~/cortex-homelab
 sed -i "s/change-me-openssl-rand-hex-32/$(openssl rand -hex 32)/" searxng/settings.yml
 sed -i "s/change-me-sync-password/<a-real-password>/" docker-compose.yml
-docker compose up -d                    # proxy + SearXNG + Whisper + Sync
+docker compose up -d                    # proxy + SearXNG + Sync (no Whisper)
+docker compose --profile whisper up -d  # …plus WhisperX, if wanted
 docker compose --profile ollama up -d   # …plus Ollama, if wanted
 ```
 

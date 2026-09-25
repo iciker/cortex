@@ -46,6 +46,8 @@ static SELF_WRITE: AtomicBool = AtomicBool::new(false);
 static DIRTY: Mutex<i64> = Mutex::new(0);
 static WAKE: Condvar = Condvar::new();
 static GEN: AtomicI64 = AtomicI64::new(0);
+// ponytail: serialize this vault's push/pull; per-vault locks if multiple vaults arrive.
+static SYNC_LOCK: Mutex<()> = Mutex::new(());
 
 /// Called from the SQLite update hook on every row change.
 pub fn mark_dirty(table: &str) {
@@ -66,15 +68,31 @@ struct LiveCfg {
 }
 
 fn read_live_cfg(c: &Connection) -> Option<LiveCfg> {
-    let enabled = repo::get_setting(c, "sync_enabled").ok().flatten().as_deref() == Some("true");
-    if !enabled {
+    let enabled = repo::get_setting(c, "sync_enabled")
+        .ok()
+        .flatten()
+        .as_deref()
+        == Some("true");
+    if !enabled
+        || repo::get_setting(c, "offline_mode")
+            .ok()
+            .flatten()
+            .as_deref()
+            == Some("true")
+    {
         return None;
     }
     let base = crate::homelab::resolved_setting(c, "syncd_url")?;
     Some(LiveCfg {
         base: base.trim_end_matches('/').to_string(),
-        user: repo::get_setting(c, "sync_user").ok().flatten().unwrap_or_default(),
-        pass: repo::get_setting(c, "sync_pass").ok().flatten().unwrap_or_default(),
+        user: repo::get_setting(c, "sync_user")
+            .ok()
+            .flatten()
+            .unwrap_or_default(),
+        pass: repo::get_setting(c, "sync_pass")
+            .ok()
+            .flatten()
+            .unwrap_or_default(),
     })
 }
 
@@ -95,11 +113,16 @@ fn get_json(cfg: &LiveCfg, path: &str) -> Result<serde_json::Value> {
     if !r.status().is_success() {
         return Err(Error::Other(format!("syncd HTTP {}", r.status())));
     }
-    r.json().map_err(|e| Error::Other(format!("syncd json: {e}")))
+    r.json()
+        .map_err(|e| Error::Other(format!("syncd json: {e}")))
 }
 
 fn setting_i64(c: &Connection, key: &str) -> i64 {
-    repo::get_setting(c, key).ok().flatten().and_then(|s| s.parse().ok()).unwrap_or(0)
+    repo::get_setting(c, key)
+        .ok()
+        .flatten()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0)
 }
 
 fn set_setting_i64(c: &Connection, key: &str, v: i64) {
@@ -114,7 +137,10 @@ fn set_setting_i64(c: &Connection, key: &str, v: i64) {
 /// Returns the number of exported rows (0 ⇒ nothing to push).
 fn build_delta(c: &Connection, out: &std::path::Path, since: i64) -> Result<i64> {
     let _ = std::fs::remove_file(out);
-    c.execute("ATTACH DATABASE ?1 AS delta", [out.to_string_lossy().as_ref()])?;
+    c.execute(
+        "ATTACH DATABASE ?1 AS delta",
+        [out.to_string_lossy().as_ref()],
+    )?;
     let mut exported: i64 = 0;
     let res = (|| -> Result<i64> {
         // Table inventory mirrors the merge: everything except internals.
@@ -153,11 +179,9 @@ fn build_delta(c: &Connection, out: &std::path::Path, since: i64) -> Result<i64>
                 &format!("CREATE TABLE delta.\"{t}\" AS SELECT * FROM main.\"{t}\" WHERE {filter}"),
                 [],
             )?;
-            exported += c.query_row(
-                &format!("SELECT COUNT(*) FROM delta.\"{t}\""),
-                [],
-                |r| r.get::<_, i64>(0),
-            )?;
+            exported += c.query_row(&format!("SELECT COUNT(*) FROM delta.\"{t}\""), [], |r| {
+                r.get::<_, i64>(0)
+            })?;
         }
         c.execute(
             &format!(
@@ -166,10 +190,15 @@ fn build_delta(c: &Connection, out: &std::path::Path, since: i64) -> Result<i64>
             ),
             [],
         )?;
-        exported += c.query_row("SELECT COUNT(*) FROM delta.tombstones", [], |r| r.get::<_, i64>(0))?;
+        exported += c.query_row("SELECT COUNT(*) FROM delta.tombstones", [], |r| {
+            r.get::<_, i64>(0)
+        })?;
         // Preference settings ride every delta (small; merge side allowlists +
         // unseals). Full copy — sealing happens on the file after DETACH.
-        c.execute("CREATE TABLE delta.settings AS SELECT key, value FROM main.settings", [])?;
+        c.execute(
+            "CREATE TABLE delta.settings AS SELECT key, value FROM main.settings",
+            [],
+        )?;
         Ok(exported)
     })();
     let _ = c.execute("DETACH DATABASE delta", []);
@@ -178,15 +207,21 @@ fn build_delta(c: &Connection, out: &std::path::Path, since: i64) -> Result<i64>
 
 /// Build + push one delta. Returns Ok(true) if something was pushed.
 fn push_once(app: &AppHandle) -> Result<bool> {
+    let _sync = SYNC_LOCK.lock().unwrap();
     let state = app.state::<AppState>();
     let (cfg, since, pass) = {
         let c = state.db.lock().unwrap();
-        let Some(cfg) = read_live_cfg(&c) else { return Ok(false) };
-        let pass = repo::get_setting(&c, "sync_pass").ok().flatten().unwrap_or_default();
+        let Some(cfg) = read_live_cfg(&c) else {
+            return Ok(false);
+        };
+        let pass = repo::get_setting(&c, "sync_pass")
+            .ok()
+            .flatten()
+            .unwrap_or_default();
         (cfg, setting_i64(&c, K_PUSHED_AT), pass)
     };
     let build_start = crate::sync::now_ms();
-    let tmp = std::env::temp_dir().join(format!("cortex-delta-{build_start}.db"));
+    let tmp = std::env::temp_dir().join(format!("cortex-delta-{}.db", crate::db::new_id()));
     let exported = {
         let c = state.db.lock().unwrap();
         build_delta(&c, &tmp, since)?
@@ -230,6 +265,14 @@ fn push_once(app: &AppHandle) -> Result<bool> {
     Ok(true)
 }
 
+fn compaction_snapshot(c: &Connection, path: &std::path::Path, seq: i64) -> Result<bool> {
+    if seq <= 0 || setting_i64(c, K_APPLIED) != seq {
+        return Ok(false);
+    }
+    c.execute("VACUUM main INTO ?1", [path.to_string_lossy().as_ref()])?;
+    Ok(true)
+}
+
 fn maybe_compact(app: &AppHandle, cfg: &LiveCfg, seq: i64, pass: &str) {
     let Ok(v) = get_json(cfg, "/seq") else { return };
     let snapshot_seq = v["snapshot_seq"].as_i64().unwrap_or(0);
@@ -237,13 +280,11 @@ fn maybe_compact(app: &AppHandle, cfg: &LiveCfg, seq: i64, pass: &str) {
         return;
     }
     let state = app.state::<AppState>();
-    let Ok(db_path) = app.path().app_data_dir().map(|d| d.join("cortex.db")) else { return };
-    let tmp = std::env::temp_dir().join(format!("cortex-compact-{seq}.db"));
+    let tmp = std::env::temp_dir().join(format!("cortex-compact-{}.db", crate::db::new_id()));
     {
         let c = state.db.lock().unwrap();
-        let _: std::result::Result<String, _> =
-            c.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |r| r.get(0));
-        if std::fs::copy(&db_path, &tmp).is_err() {
+        if !matches!(compaction_snapshot(&c, &tmp, seq), Ok(true)) {
+            let _ = std::fs::remove_file(&tmp);
             return;
         }
     }
@@ -266,14 +307,21 @@ fn maybe_compact(app: &AppHandle, cfg: &LiveCfg, seq: i64, pass: &str) {
 /// Fetch and merge everything newer than our applied watermark. Emits
 /// `sync:applied` (frontend refreshes) when anything landed.
 fn catch_up(app: &AppHandle) -> Result<()> {
+    let _sync = SYNC_LOCK.lock().unwrap();
     let state = app.state::<AppState>();
-    let Some(cfg) = ({ let c = state.db.lock().unwrap(); read_live_cfg(&c) }) else {
+    let Some(cfg) = ({
+        let c = state.db.lock().unwrap();
+        read_live_cfg(&c)
+    }) else {
         return Ok(());
     };
     let v = get_json(&cfg, "/seq")?;
     let server_seq = v["seq"].as_i64().unwrap_or(0);
     let snapshot_seq = v["snapshot_seq"].as_i64().unwrap_or(0);
-    let mut applied = { let c = state.db.lock().unwrap(); setting_i64(&c, K_APPLIED) };
+    let mut applied = {
+        let c = state.db.lock().unwrap();
+        setting_i64(&c, K_APPLIED)
+    };
     if applied > server_seq {
         applied = 0; // server log was reset — re-bootstrap (merging is idempotent)
     }
@@ -304,19 +352,34 @@ fn catch_up(app: &AppHandle) -> Result<()> {
         }
     }
     let seqs = get_json(&cfg, &format!("/deltas?since={applied}"))?;
-    for seq in seqs["seqs"].as_array().into_iter().flatten().filter_map(|s| s.as_i64()) {
+    for seq in seqs["seqs"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|s| s.as_i64())
+    {
+        if seq != applied + 1 {
+            return Err(Error::Other(format!(
+                "syncd gap after {applied}: got {seq}"
+            )));
+        }
         let r = http()
             .get(format!("{}/deltas/{seq}", cfg.base))
             .basic_auth(&cfg.user, Some(&cfg.pass))
             .send()
             .map_err(|e| Error::Other(format!("syncd delta {seq}: {e}")))?;
         if !r.status().is_success() {
-            continue; // compacted away — the next snapshot bootstrap covers it
+            // Stop here: skipping one delta would permanently advance past it.
+            return Err(Error::Other(format!(
+                "syncd delta {seq}: HTTP {}",
+                r.status()
+            )));
         }
         let bytes = r.bytes().map_err(|e| Error::Other(e.to_string()))?;
         apply_file(app, &bytes)?;
         let c = state.db.lock().unwrap();
         set_setting_i64(&c, K_APPLIED, seq);
+        applied = seq;
         merged_any = true;
     }
     if merged_any {
@@ -423,14 +486,19 @@ fn ws_worker(app: AppHandle) {
                 .replacen("http://", "ws://", 1)
         );
         let connected = (|| -> std::result::Result<(), String> {
-            let mut req = ws_url.clone().into_client_request().map_err(|e| e.to_string())?;
+            let mut req = ws_url
+                .clone()
+                .into_client_request()
+                .map_err(|e| e.to_string())?;
             if !cfg.user.is_empty() || !cfg.pass.is_empty() {
                 use base64::Engine as _;
                 let cred = base64::engine::general_purpose::STANDARD
                     .encode(format!("{}:{}", cfg.user, cfg.pass));
                 req.headers_mut().insert(
                     "Authorization",
-                    format!("Basic {cred}").parse().map_err(|_| "bad auth header")?,
+                    format!("Basic {cred}")
+                        .parse()
+                        .map_err(|_| "bad auth header")?,
                 );
             }
             let (mut ws, _resp) = tungstenite::connect(req).map_err(|e| e.to_string())?;
@@ -463,7 +531,7 @@ fn ws_worker(app: AppHandle) {
                             || e.kind() == std::io::ErrorKind::TimedOut =>
                     {
                         // Quiet minute — ping to prove the pipe is alive.
-                        if ws.send(Message::Ping(vec![].into())).is_err() {
+                        if ws.send(Message::Ping(vec![])).is_err() {
                             return Err("ping failed".into());
                         }
                     }
@@ -515,14 +583,17 @@ mod tests {
             let cb = b.db.lock().unwrap();
             crate::sync::merge_attached(&cb, &delta).unwrap();
             let name: String = cb
-                .query_row("SELECT name FROM subjects WHERE id=?1", [&subj_id], |r| r.get(0))
+                .query_row("SELECT name FROM subjects WHERE id=?1", [&subj_id], |r| {
+                    r.get(0)
+                })
                 .unwrap();
             assert_eq!(name, "Quantum Physics");
         }
 
         // A second delta since "now" is empty — the watermark works.
         let now = crate::sync::now_ms() + 10;
-        let delta2 = std::env::temp_dir().join(format!("livesync-test2-{}.db", crate::db::new_id()));
+        let delta2 =
+            std::env::temp_dir().join(format!("livesync-test2-{}.db", crate::db::new_id()));
         let n2 = {
             let ca = a.db.lock().unwrap();
             build_delta(&ca, &delta2, now).unwrap()
@@ -532,9 +603,11 @@ mod tests {
         // Delete on A → tombstone rides the next delta → B's row dies too.
         {
             let ca = a.db.lock().unwrap();
-            ca.execute("DELETE FROM subjects WHERE id=?1", [&subj_id]).unwrap();
+            ca.execute("DELETE FROM subjects WHERE id=?1", [&subj_id])
+                .unwrap();
         }
-        let delta3 = std::env::temp_dir().join(format!("livesync-test3-{}.db", crate::db::new_id()));
+        let delta3 =
+            std::env::temp_dir().join(format!("livesync-test3-{}.db", crate::db::new_id()));
         let n3 = {
             let ca = a.db.lock().unwrap();
             build_delta(&ca, &delta3, now).unwrap()
@@ -544,12 +617,139 @@ mod tests {
             let cb = b.db.lock().unwrap();
             crate::sync::merge_attached(&cb, &delta3).unwrap();
             let gone: i64 = cb
-                .query_row("SELECT COUNT(*) FROM subjects WHERE id=?1", [&subj_id], |r| r.get(0))
+                .query_row(
+                    "SELECT COUNT(*) FROM subjects WHERE id=?1",
+                    [&subj_id],
+                    |r| r.get(0),
+                )
                 .unwrap();
             assert_eq!(gone, 0, "tombstoned delete must apply on the peer");
         }
         for p in [&delta, &delta2, &delta3] {
             let _ = std::fs::remove_file(p);
         }
+    }
+}
+
+#[cfg(test)]
+mod compaction_regressions {
+    use super::*;
+
+    #[test]
+    fn snapshot_requires_all_preceding_deltas_and_contains_committed_rows() {
+        let state = crate::db::AppState::in_memory().unwrap();
+        let c = state.db.lock().unwrap();
+        let path = std::env::temp_dir().join(format!("compact-test-{}.db", crate::db::new_id()));
+        set_setting_i64(&c, K_APPLIED, 1);
+        assert!(!compaction_snapshot(&c, &path, 3).unwrap());
+        assert!(!path.exists());
+        repo::insert_subject(&c, "Peer delta 2", None, None, None).unwrap();
+        set_setting_i64(&c, K_APPLIED, 3);
+        assert!(compaction_snapshot(&c, &path, 3).unwrap());
+        let snapshot = Connection::open(&path).unwrap();
+        let name: String = snapshot
+            .query_row("SELECT name FROM subjects", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(name, "Peer delta 2");
+        assert_eq!(setting_i64(&snapshot, K_APPLIED), 3);
+        drop(snapshot);
+        std::fs::remove_file(path).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod content_sync_regressions {
+    use super::*;
+    use crate::models::CsSection;
+
+    #[test]
+    fn materials_and_sections_sync_edits_and_resist_stale_snapshot_resurrection() {
+        let a = crate::db::AppState::in_memory().unwrap();
+        let b = crate::db::AppState::in_memory().unwrap();
+        let a = a.db.lock().unwrap();
+        let b = b.db.lock().unwrap();
+        let dir = std::env::temp_dir().join(format!("content-sync-{}", crate::db::new_id()));
+        std::fs::create_dir(&dir).unwrap();
+        let section = |title: &str| CsSection {
+            id: String::new(),
+            title: title.into(),
+            state: "approved".into(),
+            items: vec![],
+            image: None,
+            image_query: None,
+        };
+        let subject = repo::insert_subject(&a, "Course", None, None, None).unwrap();
+        let material = repo::save_material(
+            &a,
+            &subject,
+            None,
+            "quiz",
+            "Original",
+            "",
+            &serde_json::json!({}),
+        )
+        .unwrap();
+        repo::save_cheatsheet(&a, &subject, None, &[section("Original section")]).unwrap();
+        a.execute_batch(
+            "UPDATE materials SET created_at=1,updated_at=1;
+            UPDATE cheatsheets SET created_at=1,updated_at=1;
+            UPDATE cheatsheet_sections SET updated_at=1;",
+        )
+        .unwrap();
+        let stale = dir.join("stale.db");
+        build_delta(&a, &stale, 0).unwrap();
+        crate::sync::merge_attached(&b, &stale).unwrap();
+        assert_eq!(
+            repo::get_cheatsheet_sections(&b, &subject, None).unwrap()[0].title,
+            "Original section"
+        );
+
+        repo::rename_material(&a, &material, "Renamed").unwrap();
+        repo::save_cheatsheet(&a, &subject, None, &[section("New section")]).unwrap();
+        let changes = dir.join("changes.db");
+        build_delta(&a, &changes, 10).unwrap();
+        crate::sync::merge_attached(&b, &changes).unwrap();
+        let title: String = b
+            .query_row(
+                "SELECT title FROM materials WHERE id=?1",
+                [&material],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(title, "Renamed");
+        let sections = repo::get_cheatsheet_sections(&b, &subject, None).unwrap();
+        assert_eq!(sections.len(), 1);
+        assert_eq!(sections[0].title, "New section");
+
+        // A deletion strictly after the edit must defeat both a delta and old snapshot.
+        a.execute("UPDATE materials SET updated_at=2 WHERE id=?1", [&material])
+            .unwrap();
+        b.execute("UPDATE materials SET updated_at=2 WHERE id=?1", [&material])
+            .unwrap();
+        repo::delete_material(&a, &material).unwrap();
+        let deletion = dir.join("deletion.db");
+        build_delta(&a, &deletion, 10).unwrap();
+        crate::sync::merge_attached(&b, &deletion).unwrap();
+        crate::sync::merge_attached(&b, &stale).unwrap();
+        let count: i64 = b
+            .query_row(
+                "SELECT count(*) FROM materials WHERE id=?1",
+                [&material],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 0);
+        assert_eq!(
+            repo::get_cheatsheet_sections(&b, &subject, None).unwrap()[0].title,
+            "New section"
+        );
+        let count: i64 = b
+            .query_row("SELECT count(*) FROM cheatsheet_sections", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            count, 1,
+            "removed sections must not survive a stale snapshot"
+        );
+        std::fs::remove_dir_all(dir).unwrap();
     }
 }

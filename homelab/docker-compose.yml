@@ -7,8 +7,9 @@
 #   <url>/ingest   → document parsing (PDF/DOCX/PPTX → text, for mobile)
 # Only Caddy publishes a host port (8080); everything else is internal.
 #
-#   docker compose up -d                    # search + whisper + sync + proxy
-#   docker compose --profile ollama up -d   # also start Ollama
+#   docker compose up -d                    # search + sync + proxy (no Whisper)
+#   docker compose --profile whisper up -d  # optionally add WhisperX
+#   docker compose --profile ollama up -d   # optionally add Ollama
 #
 # Then in Cortex → Settings → Integrations, set the single Homelab URL:
 #   http://<host>:8080      (LAN)         and, optionally, your
@@ -53,7 +54,6 @@ services:
       - caddy-data:/data
     depends_on:
       - searxng
-      - whisper
       - sync
       - ingest
 
@@ -85,22 +85,32 @@ services:
     image: onerahmet/openai-whisper-asr-webservice:latest
     container_name: cortex-whisper
     restart: unless-stopped
+    profiles: ["whisper"]
     expose:
       - "9000"
     volumes:
       # Whisper + alignment + pyannote models cache here (lazy-downloaded on
       # first use; keep the volume so restarts don't re-fetch gigabytes).
       - whisper-models:/root/.cache
+      # Upstream decodes uploads through a non-seekable stdin pipe, which
+      # produces empty audio for macOS M4A recordings with a trailing index.
+      - ./whisper-utils.py:/app/app/utils.py:ro
     environment:
       - ASR_ENGINE=whisperx
+      # PyTorch 2.6+ defaults torch.load to weights_only=true, while the
+      # bundled pyannote VAD checkpoint contains OmegaConf metadata.
+      - TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD=1
       # Model tiers (accuracy ↑ / speed ↓): small → distil-large-v3 → large-v3.
       # distil-large-v3 ≈ large-v3 accuracy on English at a fraction of the
       # compute — the right default for a CPU box. On GPU, use large-v3.
       - ASR_MODEL=${WHISPER_MODEL:-distil-large-v3}
       - ASR_DEVICE=${WHISPER_DEVICE:-cpu}
-      # Unload models after 5 idle minutes (frees RAM on a shared homelab box);
-      # the next lecture pays a short reload, not a re-download.
-      - MODEL_IDLE_TIMEOUT=300
+      # Keep the WhisperX model loaded. The current upstream image clears the
+      # complete model dictionary on idle unload, but its reload path assumes
+      # that dictionary still exists and crashes the next request with
+      # `TypeError: 'NoneType' object does not support item assignment`.
+      # Restarting this container still releases all model memory.
+      - MODEL_IDLE_TIMEOUT=0
       # SPEAKER LABELS need a (free) Hugging Face token:
       #   1. huggingface.co → create account → Settings → Access Tokens → "read" token
       #   2. Accept the terms on BOTH gated models:
